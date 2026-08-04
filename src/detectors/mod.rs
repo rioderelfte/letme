@@ -4,14 +4,12 @@ pub mod js;
 pub mod justfile;
 pub mod mise;
 pub mod node_conventions;
-pub mod npm;
 pub mod nx;
+pub mod package_json;
 pub mod php_conventions;
-pub mod pnpm;
 pub mod util;
-pub mod yarn;
 
-use crate::detect::DetectorGroup;
+use crate::detect::{Detector, DetectorGroup};
 
 /// Return all built-in detectors as exclusive groups.
 ///
@@ -22,8 +20,8 @@ use crate::detect::DetectorGroup;
 /// Group ordering encodes mutual-exclusion invariants:
 /// - Tier 2: justfile beats mise; nx is independent, overlapping names
 ///   resolve by TaskRunner priority (just 10 > mise 5 > nx 3)
-/// - Tier 3 JS: pnpm beats yarn beats npm (later: bun goes before these).
-///   This ordering mirrors the precedence table in [`js`]; keep the two in sync.
+/// - Tier 3 JS: one detector per package manager, built from the precedence
+///   table in [`js`] (pnpm beats yarn beats npm)
 pub fn all_detectors() -> Vec<DetectorGroup> {
     vec![
         // Tier 2 task runners: justfile beats mise
@@ -32,12 +30,14 @@ pub fn all_detectors() -> Vec<DetectorGroup> {
             Box::new(mise::MiseDetector),
         ]),
         DetectorGroup::new(vec![Box::new(nx::NxDetector)]),
-        // Tier 3 JS: pnpm beats yarn beats npm
-        DetectorGroup::new(vec![
-            Box::new(pnpm::PnpmDetector),
-            Box::new(yarn::YarnDetector),
-            Box::new(npm::NpmDetector),
-        ]),
+        // Tier 3 JS
+        DetectorGroup::new(
+            js::JsPackageManager::all()
+                .map(|manager| {
+                    Box::new(package_json::PackageJsonDetector::new(manager)) as Box<dyn Detector>
+                })
+                .collect(),
+        ),
         // Tier 3 PHP
         DetectorGroup::new(vec![Box::new(composer::ComposerDetector)]),
         // Tier 4: each independent

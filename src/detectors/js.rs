@@ -1,9 +1,9 @@
 //! Shared knowledge about the JavaScript package-manager landscape.
 //!
-//! Three separate concerns need to answer "which package manager owns this
-//! directory?": the tier 3 detector group ordering, the tier 4 exec prefix, and
-//! the conflicting-lockfile warning. They all read the precedence table below so
-//! the answer can never drift between them. Adding bun later is a single row.
+//! Everything that needs to answer "which package manager owns this directory,
+//! and how do I drive it?" reads the table and methods below: the tier 3
+//! detector group, the tier 4 exec prefix, and the conflicting-lockfile
+//! warning. Adding bun later is a single row plus enum arms.
 
 use std::fmt;
 use std::path::Path;
@@ -18,8 +18,8 @@ pub enum JsPackageManager {
 
 /// Which lockfile belongs to which manager, in precedence order (first match wins).
 ///
-/// This ordering is the same invariant the tier 3 JS detector group encodes in
-/// [`crate::detectors::all_detectors`]; keep the two in sync.
+/// The tier 3 JS detector group in [`crate::detectors::all_detectors`] is built
+/// from this table, so its ordering cannot drift.
 const LOCKFILES: &[(&str, JsPackageManager)] = &[
     ("pnpm-lock.yaml", JsPackageManager::Pnpm),
     ("yarn.lock", JsPackageManager::Yarn),
@@ -27,6 +27,20 @@ const LOCKFILES: &[(&str, JsPackageManager)] = &[
 ];
 
 impl JsPackageManager {
+    /// Every known manager, in lockfile-precedence order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        LOCKFILES.iter().map(|(_, manager)| *manager)
+    }
+
+    /// The package-manager binary, which is also the detector name.
+    pub fn binary(&self) -> &'static str {
+        match self {
+            Self::Pnpm => "pnpm",
+            Self::Yarn => "yarn",
+            Self::Npm => "npm",
+        }
+    }
+
     /// The lockfile that identifies this manager.
     pub fn lockfile(&self) -> &'static str {
         match self {
@@ -45,6 +59,15 @@ impl JsPackageManager {
         }
     }
 
+    /// Prefix for running a package.json script.
+    pub fn run_prefix(&self) -> &'static str {
+        match self {
+            Self::Pnpm => "pnpm run",
+            Self::Yarn => "yarn run",
+            Self::Npm => "npm run",
+        }
+    }
+
     /// Prefix for running a binary out of `node_modules/.bin`.
     ///
     /// Bare `yarn <bin>` rather than `yarn exec <bin>`, because yarn 1.x has no `exec`
@@ -60,11 +83,7 @@ impl JsPackageManager {
 
 impl fmt::Display for JsPackageManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pnpm => write!(f, "pnpm"),
-            Self::Yarn => write!(f, "yarn"),
-            Self::Npm => write!(f, "npm"),
-        }
+        f.write_str(self.binary())
     }
 }
 
