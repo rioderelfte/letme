@@ -87,7 +87,7 @@ it, per command:
    by accident.
 3. **Conventions.** `Cargo.toml`, plus known binaries in `vendor/bin` (pest,
    phpunit, phpstan, php-cs-fixer) and `node_modules/.bin` (vitest, jest,
-   eslint, prettier, biome, tsc, playwright, cypress).
+   eslint, oxlint, prettier, biome, tsc, playwright, cypress).
 
 If a project mixes ecosystems (say Rust plus JavaScript), `letme test` runs
 the test commands of both.

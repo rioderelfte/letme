@@ -543,7 +543,7 @@ fn infer_single_command(cmd: &str) -> Inference {
         },
         // Lint / Fix
         "phpstan" | "psalm" | "phpcs" => Inference::Canonical(CanonicalCommand::Lint),
-        "eslint" => {
+        "eslint" | "oxlint" => {
             if args.contains(&"--fix") {
                 Inference::Canonical(CanonicalCommand::Fix)
             } else {
@@ -1413,6 +1413,19 @@ mod tests {
         // Without --fix, still Lint
         assert_eq!(
             infer_from_command("eslint .").canonical(),
+            Some(CanonicalCommand::Lint)
+        );
+    }
+
+    #[test]
+    fn infer_oxlint_fix() {
+        assert_eq!(
+            infer_from_command("oxlint --fix").canonical(),
+            Some(CanonicalCommand::Fix)
+        );
+        // Without --fix, still Lint
+        assert_eq!(
+            infer_from_command("oxlint").canonical(),
             Some(CanonicalCommand::Lint)
         );
     }

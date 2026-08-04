@@ -49,6 +49,7 @@ pub fn all_detectors() -> Vec<DetectorGroup> {
         DetectorGroup::new(vec![Box::new(node_conventions::VitestDetector)]),
         DetectorGroup::new(vec![Box::new(node_conventions::JestDetector)]),
         DetectorGroup::new(vec![Box::new(node_conventions::EslintDetector)]),
+        DetectorGroup::new(vec![Box::new(node_conventions::OxlintDetector)]),
         DetectorGroup::new(vec![Box::new(node_conventions::PrettierDetector)]),
         DetectorGroup::new(vec![Box::new(node_conventions::BiomeDetector)]),
         DetectorGroup::new(vec![Box::new(node_conventions::TscDetector)]),

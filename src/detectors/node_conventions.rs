@@ -7,6 +7,7 @@ use crate::detect::*;
 pub struct VitestDetector;
 pub struct JestDetector;
 pub struct EslintDetector;
+pub struct OxlintDetector;
 pub struct PrettierDetector;
 pub struct BiomeDetector;
 pub struct TscDetector;
@@ -88,6 +89,33 @@ impl Detector for EslintDetector {
         vec![
             self.make_command(CanonicalCommand::Lint, format!("{exec} eslint ."), 5),
             self.make_command(CanonicalCommand::Fix, format!("{exec} eslint --fix ."), 5),
+        ]
+    }
+}
+
+impl Detector for OxlintDetector {
+    fn name(&self) -> &str {
+        "oxlint"
+    }
+
+    fn tier(&self) -> Tier {
+        Tier::Tier4
+    }
+
+    fn ecosystem(&self) -> Ecosystem {
+        Ecosystem::JavaScript
+    }
+
+    fn detect(&self, dir: &Path) -> bool {
+        // No config check: oxlint is zero-config by default
+        dir.join("node_modules/.bin/oxlint").exists()
+    }
+
+    fn resolve_commands(&self, dir: &Path) -> Vec<ResolvedCommand> {
+        let exec = js::detect_manager(dir).exec_prefix();
+        vec![
+            self.make_command(CanonicalCommand::Lint, format!("{exec} oxlint"), 3),
+            self.make_command(CanonicalCommand::Fix, format!("{exec} oxlint --fix"), 3),
         ]
     }
 }
@@ -336,6 +364,21 @@ mod tests {
     }
 
     #[test]
+    fn oxlint_detects_with_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        make_node_bin(dir.path(), "oxlint");
+
+        assert!(OxlintDetector.detect(dir.path()));
+    }
+
+    #[test]
+    fn oxlint_does_not_detect_without_binary() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!OxlintDetector.detect(dir.path()));
+    }
+
+    #[test]
     fn prettier_detects_with_binary() {
         let dir = tempfile::tempdir().unwrap();
         make_node_bin(dir.path(), "prettier");
@@ -505,6 +548,40 @@ mod tests {
     }
 
     #[test]
+    fn oxlint_resolves_lint_and_fix_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = OxlintDetector.resolve_commands(dir.path());
+        let lint = commands
+            .iter()
+            .find(|c| c.canonical == CanonicalCommand::Lint);
+        assert_eq!(lint.unwrap().cmd, "npx oxlint");
+        let fix = commands
+            .iter()
+            .find(|c| c.canonical == CanonicalCommand::Fix);
+        assert_eq!(fix.unwrap().cmd, "npx oxlint --fix");
+    }
+
+    #[test]
+    fn eslint_beats_oxlint_within_ecosystem() {
+        use crate::detect;
+
+        let dir = tempfile::tempdir().unwrap();
+        make_node_bin(dir.path(), "eslint");
+        make_node_bin(dir.path(), "oxlint");
+        std::fs::write(dir.path().join("eslint.config.js"), "").unwrap();
+
+        let groups = vec![
+            detect::DetectorGroup::new(vec![Box::new(EslintDetector) as Box<dyn detect::Detector>]),
+            detect::DetectorGroup::new(vec![Box::new(OxlintDetector) as Box<dyn detect::Detector>]),
+        ];
+        let result = detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Lint], false);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].cmd, "npx eslint .");
+        assert_eq!(result[0].detector_name, "eslint");
+    }
+
+    #[test]
     fn biome_resolves_fix_command() {
         let dir = tempfile::tempdir().unwrap();
         let commands = BiomeDetector.resolve_commands(dir.path());
@@ -563,6 +640,7 @@ mod tests {
             VitestDetector.resolve_commands(dir.path()),
             JestDetector.resolve_commands(dir.path()),
             EslintDetector.resolve_commands(dir.path()),
+            OxlintDetector.resolve_commands(dir.path()),
             PrettierDetector.resolve_commands(dir.path()),
             BiomeDetector.resolve_commands(dir.path()),
             TscDetector.resolve_commands(dir.path()),
