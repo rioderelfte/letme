@@ -5,6 +5,21 @@ use owo_colors::Style;
 
 use crate::config::Config;
 
+/// Replace control characters and bidi overrides with U+FFFD so text taken
+/// from project files (script names and values, task names) cannot inject
+/// terminal escape sequences or visually reorder our output.
+pub fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Semantic theme slots with resolved styles.
 pub struct Theme {
     pub success: Style,
@@ -110,5 +125,25 @@ mod tests {
     fn default_theme_emits_ansi_codes() {
         let theme = Theme::default();
         assert_ne!(format!("{}", "x".style(theme.success)), "x");
+    }
+
+    #[test]
+    fn sanitize_replaces_c0_and_c1_controls() {
+        assert_eq!(sanitize("a\x1b[31mb"), "a\u{FFFD}[31mb");
+        // raw C1 CSI, accepted by some terminals without a preceding ESC
+        assert_eq!(sanitize("a\u{9B}2Kb"), "a\u{FFFD}2Kb");
+        assert_eq!(sanitize("a\tb\nc\rd"), "a\u{FFFD}b\u{FFFD}c\u{FFFD}d");
+    }
+
+    #[test]
+    fn sanitize_replaces_bidi_overrides() {
+        assert_eq!(sanitize("a\u{202E}b"), "a\u{FFFD}b");
+        assert_eq!(sanitize("a\u{2066}b\u{2069}c"), "a\u{FFFD}b\u{FFFD}c");
+    }
+
+    #[test]
+    fn sanitize_keeps_printable_text() {
+        let s = "pnpm run test:e2e — 构建 ✓";
+        assert_eq!(sanitize(s), s);
     }
 }

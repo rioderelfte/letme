@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
-use crate::theme::Theme;
+use crate::theme::{Theme, sanitize};
 
 pub fn show(
     dir: &Path,
@@ -89,15 +89,15 @@ pub fn show(
                 println!(
                     "    {} {} {} {}",
                     "→".style(theme.accent),
-                    cmd.cmd.style(theme.info),
-                    format!("({})", cmd.label).style(theme.muted),
+                    sanitize(&cmd.cmd).style(theme.info),
+                    format!("({})", sanitize(&cmd.label)).style(theme.muted),
                     format!("[{}, {}]", cmd.tier, cmd.detector_name).style(theme.muted),
                 );
             } else {
                 println!(
                     "    {} {} {}",
                     "→".style(theme.accent),
-                    cmd.cmd.style(theme.info),
+                    sanitize(&cmd.cmd).style(theme.info),
                     format!("[{}, {}]", cmd.tier, cmd.detector_name).style(theme.muted),
                 );
             }

@@ -2,6 +2,8 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
+use crate::theme::sanitize;
+
 /// Canonical commands that letme understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CanonicalCommand {
@@ -331,7 +333,11 @@ pub fn resolve_all(
                     if verbose {
                         eprintln!(
                             "[verbose] {cmd}: '{}' (priority {}) beaten by '{}' (priority {}) in {}",
-                            r.cmd, r.priority, existing.cmd, existing.priority, r.ecosystem
+                            sanitize(&r.cmd),
+                            r.priority,
+                            sanitize(&existing.cmd),
+                            existing.priority,
+                            r.ecosystem
                         );
                     }
                 }
@@ -339,7 +345,11 @@ pub fn resolve_all(
                     if verbose && let Some(old) = seen_ecosystems.get(&r.ecosystem) {
                         eprintln!(
                             "[verbose] {cmd}: '{}' (priority {}) replaces '{}' (priority {}) in {}",
-                            r.cmd, r.priority, old.cmd, old.priority, r.ecosystem
+                            sanitize(&r.cmd),
+                            r.priority,
+                            sanitize(&old.cmd),
+                            old.priority,
+                            r.ecosystem
                         );
                     }
                     seen_ecosystems.insert(r.ecosystem, r);
@@ -356,7 +366,8 @@ pub fn resolve_all(
             for r in &cmd_results {
                 eprintln!(
                     "[verbose] {cmd}: resolved → '{}' [{}]",
-                    r.cmd, r.detector_name
+                    sanitize(&r.cmd),
+                    r.detector_name
                 );
             }
         }

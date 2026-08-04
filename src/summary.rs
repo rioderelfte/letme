@@ -3,7 +3,7 @@ use std::time::Duration;
 use owo_colors::OwoColorize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::theme::Theme;
+use crate::theme::{Theme, sanitize};
 
 /// Widest the command column may grow
 const MAX_CMD_WIDTH: usize = 48;
@@ -109,7 +109,7 @@ struct Cells<'a> {
 fn to_cells(row: &SummaryRow) -> Cells<'_> {
     let cmd = match (&row.outcome, &row.cmd) {
         (Outcome::NotDetected, _) => "not detected".to_string(),
-        (_, Some(cmd)) => truncate_to_width(cmd, MAX_CMD_WIDTH),
+        (_, Some(cmd)) => truncate_to_width(&sanitize(cmd), MAX_CMD_WIDTH),
         (_, None) => String::new(),
     };
     let (glyph, trail, annotation) = match &row.outcome {
@@ -278,6 +278,18 @@ mod tests {
         let cut = truncate_to_width(&long, 48);
         assert_eq!(cut.width(), 47);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn hostile_command_text_is_neutralized() {
+        let rows = vec![
+            row("test", Some("echo \x1b[2K\rjest"), success(10)),
+            row("build", Some("cargo build"), success(10)),
+        ];
+        let rendered = render(&rows, &Theme::plain());
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("echo \u{FFFD}[2K\u{FFFD}jest"));
     }
 
     #[test]

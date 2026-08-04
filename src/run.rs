@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
 use crate::doctor;
 use crate::summary::{self, Outcome, SummaryRow};
-use crate::theme::Theme;
+use crate::theme::{Theme, sanitize};
 
 /// Error indicating a subprocess exited with a specific code.
 #[derive(Debug)]
@@ -176,14 +176,14 @@ fn execute_one(
     dir: &Path,
 ) -> Result<Outcome> {
     if interactive {
-        let prompt = format!("Run `{}`?", cmd.cmd);
+        let prompt = format!("Run `{}`?", sanitize(&cmd.cmd));
         match inquire::Confirm::new(&prompt).with_default(true).prompt() {
             Ok(true) => {}
             Ok(false) => {
                 println!(
                     "  {} {} {}",
                     "⊘".style(theme.muted),
-                    cmd.label.style(theme.muted),
+                    sanitize(&cmd.label).style(theme.muted),
                     "(skipped)".style(theme.muted)
                 );
                 return Ok(Outcome::Declined);
@@ -198,7 +198,7 @@ fn execute_one(
     println!(
         "{} {}",
         "→".style(theme.accent),
-        cmd.cmd.style(theme.command)
+        sanitize(&cmd.cmd).style(theme.command)
     );
 
     let start = Instant::now();
