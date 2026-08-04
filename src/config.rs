@@ -80,7 +80,8 @@ impl Config {
     }
 
     /// Expand a list of command/alias names into canonical command names.
-    /// Aliases are expanded inline, duplicates are removed (first occurrence wins).
+    /// Aliases are expanded recursively and may reference other aliases;
+    /// cycles are an error. Duplicates are removed (first occurrence wins).
     /// Supports unambiguous prefix matching (e.g. "te" resolves to "test", "i" to "install").
     pub fn expand_aliases(&self, names: &[String]) -> Result<Vec<String>, String> {
         let aliases = self.effective_aliases();
@@ -89,27 +90,53 @@ impl Config {
 
         for name in names {
             let resolved = self.resolve_name(name, &aliases)?;
-
-            if let Some(expansion) = aliases.get(&resolved) {
-                for expanded in expansion {
-                    if seen.insert(expanded.clone()) {
-                        result.push(expanded.clone());
-                    }
-                }
-            } else if seen.insert(resolved.clone()) {
-                result.push(resolved);
-            }
-        }
-
-        // Validate all expanded names are valid canonical commands or built-in subcommands
-        for name in &result {
-            if name != "doctor" {
-                name.parse::<CanonicalCommand>()?;
-            }
+            expand_into(&resolved, &aliases, &mut Vec::new(), &mut seen, &mut result)?;
         }
 
         Ok(result)
     }
+}
+
+fn expand_into(
+    name: &str,
+    aliases: &HashMap<String, Vec<String>>,
+    visiting: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    result: &mut Vec<String>,
+) -> Result<(), String> {
+    if let Some(expansion) = aliases.get(name) {
+        if visiting.iter().any(|v| v == name) {
+            return Err(if visiting.last().is_some_and(|v| v == name) {
+                let hint = if default_aliases().contains_key(name) {
+                    " To extend the built-in alias, list its commands explicitly."
+                } else {
+                    ""
+                };
+                format!("Alias '{name}' references itself.{hint}")
+            } else {
+                format!("Alias cycle: {} -> {name}", visiting.join(" -> "))
+            });
+        }
+        visiting.push(name.to_string());
+        for element in expansion {
+            expand_into(element, aliases, visiting, seen, result)?;
+        }
+        visiting.pop();
+    } else if name == "doctor" || name.parse::<CanonicalCommand>().is_ok() {
+        if seen.insert(name.to_string()) {
+            result.push(name.to_string());
+        }
+    } else {
+        let context = visiting
+            .last()
+            .map(|parent| format!(" (in alias '{parent}')"))
+            .unwrap_or_default();
+        return Err(format!(
+            "Unknown command: {name}{context}. Valid commands: {}, doctor",
+            CanonicalCommand::all_names()
+        ));
+    }
+    Ok(())
 }
 
 fn default_aliases() -> HashMap<String, Vec<String>> {
@@ -210,6 +237,83 @@ mod tests {
         let config = Config::default();
         let result = config.expand_aliases(&["build".into()]).unwrap();
         assert_eq!(result, vec!["build"]);
+    }
+
+    #[test]
+    fn expand_nested_alias() {
+        let config = Config {
+            aliases: HashMap::from([("full".into(), vec!["ok".into(), "build".into()])]),
+            ..Default::default()
+        };
+        let result = config.expand_aliases(&["full".into()]).unwrap();
+        assert_eq!(result, vec!["format", "lint", "typecheck", "test", "build"]);
+    }
+
+    #[test]
+    fn expand_nested_alias_deduplicates() {
+        let config = Config {
+            aliases: HashMap::from([("full".into(), vec!["test".into(), "ok".into()])]),
+            ..Default::default()
+        };
+        let result = config.expand_aliases(&["full".into()]).unwrap();
+        assert_eq!(result, vec!["test", "format", "lint", "typecheck"]);
+    }
+
+    #[test]
+    fn expand_doctor_in_alias_value() {
+        let config = Config {
+            aliases: HashMap::from([("checkup".into(), vec!["doctor".into(), "test".into()])]),
+            ..Default::default()
+        };
+        let result = config.expand_aliases(&["checkup".into()]).unwrap();
+        assert_eq!(result, vec!["doctor", "test"]);
+    }
+
+    #[test]
+    fn self_referencing_alias_errors() {
+        let config = Config {
+            aliases: HashMap::from([("ok".into(), vec!["ok".into(), "e2e".into()])]),
+            ..Default::default()
+        };
+        let err = config.expand_aliases(&["ok".into()]).unwrap_err();
+        assert!(err.contains("Alias 'ok' references itself"), "got: {err}");
+        assert!(err.contains("built-in"), "got: {err}");
+    }
+
+    #[test]
+    fn self_referencing_user_alias_errors_without_builtin_hint() {
+        let config = Config {
+            aliases: HashMap::from([("foo".into(), vec!["foo".into()])]),
+            ..Default::default()
+        };
+        let err = config.expand_aliases(&["foo".into()]).unwrap_err();
+        assert!(err.contains("Alias 'foo' references itself"), "got: {err}");
+        assert!(!err.contains("built-in"), "got: {err}");
+    }
+
+    #[test]
+    fn alias_cycle_errors() {
+        let config = Config {
+            aliases: HashMap::from([
+                ("a".into(), vec!["b".into()]),
+                ("b".into(), vec!["a".into()]),
+            ]),
+            ..Default::default()
+        };
+        let err = config.expand_aliases(&["a".into()]).unwrap_err();
+        assert!(err.contains("Alias cycle: a -> b -> a"), "got: {err}");
+    }
+
+    #[test]
+    fn prefix_in_alias_value_errors() {
+        // Alias values must be exact names; prefixes only resolve on the command line
+        let config = Config {
+            aliases: HashMap::from([("ci".into(), vec!["te".into()])]),
+            ..Default::default()
+        };
+        let err = config.expand_aliases(&["ci".into()]).unwrap_err();
+        assert!(err.contains("Unknown command: te"), "got: {err}");
+        assert!(err.contains("in alias 'ci'"), "got: {err}");
     }
 
     #[test]
