@@ -4,16 +4,19 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::detect::{self, CanonicalCommand, ResolvedCommand};
-use crate::detectors;
+use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
 use crate::theme::Theme;
 
-pub fn show(dir: &Path, verbose: bool, theme: &Theme, config: &Config) -> Result<()> {
-    let all_detectors = detectors::all_detectors();
-
+pub fn show(
+    dir: &Path,
+    groups: &[DetectorGroup],
+    verbose: bool,
+    theme: &Theme,
+    config: &Config,
+) -> Result<()> {
     // Find which detectors match (respecting exclusive groups)
     let mut detected: Vec<(&str, detect::Ecosystem)> = Vec::new();
-    for group in &all_detectors {
+    for group in groups {
         for detector in &group.0 {
             if detector.detect(dir) {
                 detected.push((detector.name(), detector.ecosystem()));
@@ -47,7 +50,7 @@ pub fn show(dir: &Path, verbose: bool, theme: &Theme, config: &Config) -> Result
         );
     }
 
-    let missing = detect::check_missing_binaries(&all_detectors, dir);
+    let missing = detect::check_missing_binaries(groups, dir);
     for m in &missing {
         eprintln!(
             "{} {} detected but {} is not installed",
@@ -59,7 +62,7 @@ pub fn show(dir: &Path, verbose: bool, theme: &Theme, config: &Config) -> Result
 
     println!();
 
-    let resolved = detect::resolve_all(&all_detectors, dir, CanonicalCommand::all(), verbose);
+    let resolved = detect::resolve_all(groups, dir, CanonicalCommand::all(), verbose);
 
     let mut by_command: BTreeMap<String, Vec<&ResolvedCommand>> = BTreeMap::new();
     for cmd in &resolved {

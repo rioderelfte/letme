@@ -2,7 +2,54 @@ use std::path::{Path, PathBuf};
 
 use crate::detect::{Detector, Ecosystem, ResolvedCommand, Tier, map_canonical_name};
 
-pub struct MiseDetector;
+/// The mise task list, loaded once per invocation in `main` and shared between
+/// the untrusted-config warning and [`MiseDetector`].
+#[derive(Default)]
+pub struct MiseTasks {
+    tasks: Vec<String>,
+    untrusted: bool,
+}
+
+impl MiseTasks {
+    /// Run `mise tasks --json` in `dir`, if there is a config and a binary.
+    pub fn load(dir: &Path) -> Self {
+        if config_path(dir).is_none() || which::which("mise").is_err() {
+            return Self::default();
+        }
+
+        let Ok(output) = std::process::Command::new("mise")
+            .args(["tasks", "--json"])
+            .current_dir(dir)
+            .output()
+        else {
+            return Self::default();
+        };
+
+        if !output.status.success() {
+            return Self {
+                tasks: Vec::new(),
+                untrusted: is_untrusted_error(&String::from_utf8_lossy(&output.stderr)),
+            };
+        }
+
+        Self {
+            tasks: parse_mise_tasks(&output.stdout),
+            untrusted: false,
+        }
+    }
+}
+
+pub struct MiseDetector {
+    tasks: Vec<String>,
+}
+
+impl MiseDetector {
+    pub fn new(mise_tasks: &MiseTasks) -> Self {
+        Self {
+            tasks: mise_tasks.tasks.clone(),
+        }
+    }
+}
 
 impl Detector for MiseDetector {
     fn name(&self) -> &str {
@@ -25,11 +72,10 @@ impl Detector for MiseDetector {
         config_path(dir).is_some()
     }
 
-    fn resolve_commands(&self, dir: &Path) -> Vec<ResolvedCommand> {
-        let tasks = read_mise_tasks(dir);
+    fn resolve_commands(&self, _dir: &Path) -> Vec<ResolvedCommand> {
         let mut commands = Vec::new();
 
-        for task in &tasks {
+        for task in &self.tasks {
             if let Some(canonical) = map_canonical_name(task) {
                 commands.push(self.make_command(canonical, format!("mise run {task}"), 5));
             }
@@ -45,26 +91,6 @@ fn config_path(dir: &Path) -> Option<PathBuf> {
         .iter()
         .map(|name| dir.join(name))
         .find(|path| path.exists())
-}
-
-fn run_mise_tasks(dir: &Path) -> Option<std::process::Output> {
-    std::process::Command::new("mise")
-        .args(["tasks", "--json"])
-        .current_dir(dir)
-        .output()
-        .ok()
-}
-
-fn read_mise_tasks(dir: &Path) -> Vec<String> {
-    let Some(output) = run_mise_tasks(dir) else {
-        return Vec::new();
-    };
-
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    parse_mise_tasks(&output.stdout)
 }
 
 fn parse_mise_tasks(stdout: &[u8]) -> Vec<String> {
@@ -87,20 +113,8 @@ fn parse_mise_tasks(stdout: &[u8]) -> Vec<String> {
         .collect()
 }
 
-pub fn warn_untrusted_config(dir: &Path, theme: &crate::theme::Theme) {
-    if config_path(dir).is_none() || which::which("mise").is_err() {
-        return;
-    }
-
-    let Some(output) = run_mise_tasks(dir) else {
-        return;
-    };
-
-    if output.status.success() {
-        return;
-    }
-
-    if !is_untrusted_error(&String::from_utf8_lossy(&output.stderr)) {
+pub fn warn_untrusted_config(mise_tasks: &MiseTasks, theme: &crate::theme::Theme) {
+    if !mise_tasks.untrusted {
         return;
     }
 
@@ -145,6 +159,19 @@ mod tests {
         assert!(parse_mise_tasks(b"not json").is_empty());
         assert!(parse_mise_tasks(br#"{"tasks": []}"#).is_empty());
         assert!(parse_mise_tasks(br#"[{"description": "no name"}]"#).is_empty());
+    }
+
+    #[test]
+    fn detector_resolves_only_canonical_task_names() {
+        let mise_tasks = MiseTasks {
+            tasks: vec!["test".into(), "deploy".into()],
+            untrusted: false,
+        };
+
+        let commands = MiseDetector::new(&mise_tasks).resolve_commands(Path::new("."));
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].cmd, "mise run test");
     }
 
     #[test]

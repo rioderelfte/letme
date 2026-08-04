@@ -5,8 +5,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::detect::{self, CanonicalCommand, ResolvedCommand};
-use crate::detectors;
+use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
 use crate::doctor;
 use crate::summary::{self, Outcome, SummaryRow};
 use crate::theme::Theme;
@@ -33,14 +32,13 @@ enum PlanEntry<'a> {
 
 pub fn run(
     dir: &Path,
+    groups: &[DetectorGroup],
     names: &[String],
     interactive: bool,
     verbose: bool,
     theme: &Theme,
     config: &Config,
 ) -> Result<()> {
-    let all_detectors = detectors::all_detectors();
-
     let expanded = config
         .expand_aliases(names)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -52,11 +50,11 @@ pub fn run(
         .collect();
 
     // Resolve all canonical commands in one pass (avoids redundant detect() calls)
-    let resolved = detect::resolve_all(&all_detectors, dir, &canonicals, verbose);
+    let resolved = detect::resolve_all(groups, dir, &canonicals, verbose);
 
     let chained = expanded.len() > 1;
     let plan = build_plan(&expanded, &resolved, chained)?;
-    let (rows, failure) = execute_plan(&plan, dir, interactive, theme)?;
+    let (rows, failure) = execute_plan(&plan, dir, groups, interactive, theme)?;
 
     if summary::should_print(&rows) {
         println!();
@@ -103,6 +101,7 @@ fn build_plan<'a>(
 fn execute_plan(
     plan: &[PlanEntry],
     dir: &Path,
+    groups: &[DetectorGroup],
     interactive: bool,
     theme: &Theme,
 ) -> Result<(Vec<SummaryRow>, Option<i32>)> {
@@ -116,7 +115,7 @@ fn execute_plan(
                     Outcome::NotRun
                 } else {
                     let start = Instant::now();
-                    let all_passed = doctor::run(dir, theme)?;
+                    let all_passed = doctor::run(dir, groups, theme)?;
                     let duration = start.elapsed();
                     if all_passed {
                         Outcome::Success { duration }
@@ -285,7 +284,7 @@ mod tests {
         ];
         let plan: Vec<PlanEntry> = resolved.iter().map(PlanEntry::Exec).collect();
         let dir = tempfile::tempdir().unwrap();
-        let (rows, failure) = execute_plan(&plan, dir.path(), false, &Theme::plain()).unwrap();
+        let (rows, failure) = execute_plan(&plan, dir.path(), &[], false, &Theme::plain()).unwrap();
 
         assert_eq!(failure, Some(7));
         assert!(matches!(rows[0].outcome, Outcome::Success { .. }));

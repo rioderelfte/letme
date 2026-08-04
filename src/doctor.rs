@@ -2,8 +2,7 @@ use anyhow::Result;
 use owo_colors::OwoColorize;
 use std::path::Path;
 
-use crate::detect;
-use crate::detectors;
+use crate::detect::{self, DetectorGroup};
 use crate::detectors::js::{self, JsPackageManager};
 use crate::theme::Theme;
 
@@ -19,8 +18,8 @@ enum CheckStatus {
     Fail,
 }
 
-pub fn run(dir: &Path, theme: &Theme) -> Result<bool> {
-    let checks = run_all_checks(dir);
+pub fn run(dir: &Path, groups: &[DetectorGroup], theme: &Theme) -> Result<bool> {
+    let checks = run_all_checks(dir, groups);
 
     if checks.is_empty() {
         println!(
@@ -62,10 +61,10 @@ pub fn run(dir: &Path, theme: &Theme) -> Result<bool> {
     Ok(!has_failure)
 }
 
-fn run_all_checks(dir: &Path) -> Vec<Check> {
+fn run_all_checks(dir: &Path, groups: &[DetectorGroup]) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    check_required_binaries(dir, &mut checks);
+    check_required_binaries(dir, groups, &mut checks);
     check_node_modules(dir, &mut checks);
     check_composer_vendor(dir, &mut checks);
     check_env_file(dir, &mut checks);
@@ -73,9 +72,8 @@ fn run_all_checks(dir: &Path) -> Vec<Check> {
     checks
 }
 
-fn check_required_binaries(dir: &Path, checks: &mut Vec<Check>) {
-    let groups = detectors::all_detectors();
-    let missing = detect::check_missing_binaries(&groups, dir);
+fn check_required_binaries(dir: &Path, groups: &[DetectorGroup], checks: &mut Vec<Check>) {
+    let missing = detect::check_missing_binaries(groups, dir);
     for m in missing {
         checks.push(Check {
             name: m.binary.clone(),

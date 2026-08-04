@@ -34,13 +34,17 @@ fn run_app(cli: Cli, config: &config::Config, theme: &theme::Theme) -> anyhow::R
     let dir = std::env::current_dir()?;
 
     detectors::js::warn_conflicting_lockfiles(&dir, theme);
-    detectors::mise::warn_untrusted_config(&dir, theme);
+    let mise_tasks = detectors::mise::MiseTasks::load(&dir);
+    detectors::mise::warn_untrusted_config(&mise_tasks, theme);
+
+    let groups = detectors::all_detectors(&mise_tasks);
 
     if cli.commands.is_empty() {
-        info::show(&dir, cli.verbose, theme, config)?;
+        info::show(&dir, &groups, cli.verbose, theme, config)?;
     } else {
         run::run(
             &dir,
+            &groups,
             &cli.commands,
             cli.interactive,
             cli.verbose,

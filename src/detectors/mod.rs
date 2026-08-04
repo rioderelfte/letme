@@ -22,12 +22,12 @@ use crate::detect::{Detector, DetectorGroup};
 ///   resolve by TaskRunner priority (just 10 > mise 5 > nx 3)
 /// - Tier 3 JS: one detector per package manager, built from the precedence
 ///   table in [`js`] (pnpm beats yarn beats npm)
-pub fn all_detectors() -> Vec<DetectorGroup> {
+pub fn all_detectors(mise_tasks: &mise::MiseTasks) -> Vec<DetectorGroup> {
     vec![
         // Tier 2 task runners: justfile beats mise
         DetectorGroup::new(vec![
             Box::new(justfile::JustfileDetector),
-            Box::new(mise::MiseDetector),
+            Box::new(mise::MiseDetector::new(mise_tasks)),
         ]),
         DetectorGroup::new(vec![Box::new(nx::NxDetector)]),
         // Tier 3 JS
