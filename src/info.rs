@@ -31,16 +31,20 @@ pub fn show(dir: &Path, verbose: bool, theme: &Theme, config: &Config) -> Result
     }
 
     println!("{}", "Detected ecosystems:".style(theme.header));
-    let mut seen_ecosystems = std::collections::HashSet::new();
+    let mut ecosystems: Vec<(detect::Ecosystem, Vec<&str>)> = Vec::new();
     for &(name, ecosystem) in &detected {
-        if seen_ecosystems.insert(ecosystem) {
-            println!(
-                "  {} {} {}",
-                "•".style(theme.accent),
-                ecosystem.to_string().style(theme.primary),
-                format!("({})", name).style(theme.muted),
-            );
+        match ecosystems.iter_mut().find(|(e, _)| *e == ecosystem) {
+            Some((_, names)) => names.push(name),
+            None => ecosystems.push((ecosystem, vec![name])),
         }
+    }
+    for (ecosystem, names) in &ecosystems {
+        println!(
+            "  {} {} {}",
+            "•".style(theme.accent),
+            ecosystem.to_string().style(theme.primary),
+            format!("({})", names.join(", ")).style(theme.muted),
+        );
     }
 
     let missing = detect::check_missing_binaries(&all_detectors, dir);

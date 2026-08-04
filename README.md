@@ -75,9 +75,10 @@ but not exhaustive.
 Detection runs in three tiers. A more specific tier wins over the ones below
 it, per command:
 
-1. **Task runners.** A `Justfile` recipe or mise task named like a canonical
-   command overrides everything else for that command. Justfile wins over
-   mise if both exist.
+1. **Task runners.** A `Justfile` recipe, mise task, or nx target named like a
+   canonical command overrides everything else for that command. If the same
+   name exists in several task runners, Justfile wins over mise, and both win
+   over nx.
 2. **Ecosystem scripts.** Scripts from `package.json` (npm, yarn, or pnpm,
    picked by lockfile) and `composer.json`. Names match exactly or by prefix
    (`test`, `test:unit`), and the script content is inspected as a
@@ -116,11 +117,12 @@ palette files; see [docs/theming.md](docs/theming.md).
 
 I built this for my own daily work and it is early. Things to know:
 
-- Supported ecosystems are the ones I use: JS/TS, PHP, Rust, plus Justfile
-  and mise. Others may follow.
+- Supported ecosystems are the ones I use: JS/TS, PHP, Rust, plus Justfile,
+  mise, and nx. Others may follow.
 - Unix only for now.
 - Detection looks at the current directory only. There is no walking up to
-  the project root yet, and no monorepo awareness.
+  the project root yet; monorepo awareness is limited to nx workspaces run
+  from their root.
 - `letme` executes what it detects. In a repo you don't trust, look at the
   info view before running anything.
 

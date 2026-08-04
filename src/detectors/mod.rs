@@ -5,6 +5,7 @@ pub mod justfile;
 pub mod mise;
 pub mod node_conventions;
 pub mod npm;
+pub mod nx;
 pub mod php_conventions;
 pub mod pnpm;
 pub mod util;
@@ -19,7 +20,8 @@ use crate::detect::DetectorGroup;
 /// Single-element groups behave as independent detectors.
 ///
 /// Group ordering encodes mutual-exclusion invariants:
-/// - Tier 2: justfile beats mise
+/// - Tier 2: justfile beats mise; nx is independent, overlapping names
+///   resolve by TaskRunner priority (just 10 > mise 5 > nx 3)
 /// - Tier 3 JS: pnpm beats yarn beats npm (later: bun goes before these).
 ///   This ordering mirrors the precedence table in [`js`]; keep the two in sync.
 pub fn all_detectors() -> Vec<DetectorGroup> {
@@ -29,6 +31,7 @@ pub fn all_detectors() -> Vec<DetectorGroup> {
             Box::new(justfile::JustfileDetector),
             Box::new(mise::MiseDetector),
         ]),
+        DetectorGroup::new(vec![Box::new(nx::NxDetector)]),
         // Tier 3 JS: pnpm beats yarn beats npm
         DetectorGroup::new(vec![
             Box::new(pnpm::PnpmDetector),
