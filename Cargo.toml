@@ -5,6 +5,7 @@ edition = "2024"
 description = "Auto-detecting dev command runner: letme test runs the right test command in any project"
 repository = "https://github.com/rioderelfte/letme"
 license = "MIT"
+rust-version = "1.87"
 authors = ["Florian Sowade"]
 keywords = ["cli", "task-runner", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
