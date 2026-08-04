@@ -5,6 +5,7 @@ mod detectors;
 mod doctor;
 mod info;
 mod run;
+mod summary;
 mod theme;
 
 use clap::Parser;

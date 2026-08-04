@@ -19,6 +19,7 @@ owo-colors = "4"
 supports-color = "3"
 inquire = "0.9"
 etcetera = "0.11"
+unicode-width = "0.2"
 which = "8"
 
 [dev-dependencies]

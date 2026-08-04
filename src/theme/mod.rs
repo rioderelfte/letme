@@ -34,7 +34,7 @@ impl Theme {
     }
 
     /// Theme with no styling at all, for non-terminal output or NO_COLOR.
-    fn plain() -> Self {
+    pub(crate) fn plain() -> Self {
         Theme {
             success: Style::new(),
             error: Style::new(),

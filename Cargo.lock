@@ -309,6 +309,7 @@ dependencies = [
  "supports-color",
  "tempfile",
  "toml",
+ "unicode-width",
  "which",
 ]
 
