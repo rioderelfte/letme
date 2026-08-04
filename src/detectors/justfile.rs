@@ -56,7 +56,11 @@ fn read_just_recipes(dir: &Path) -> Vec<String> {
         return Vec::new();
     }
 
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+    parse_just_recipes(&output.stdout)
+}
+
+fn parse_just_recipes(stdout: &[u8]) -> Vec<String> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(stdout) else {
         return Vec::new();
     };
 
@@ -65,4 +69,23 @@ fn read_just_recipes(dir: &Path) -> Vec<String> {
     };
 
     recipes.keys().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_just_recipes_extracts_recipe_names() {
+        let json = br#"{"recipes": {"build": {"body": []}, "test": {"body": []}}}"#;
+
+        assert_eq!(parse_just_recipes(json), vec!["build", "test"]);
+    }
+
+    #[test]
+    fn parse_just_recipes_handles_malformed_output() {
+        assert!(parse_just_recipes(b"not json").is_empty());
+        assert!(parse_just_recipes(br#"{"aliases": {}}"#).is_empty());
+        assert!(parse_just_recipes(br#"{"recipes": []}"#).is_empty());
+    }
 }
