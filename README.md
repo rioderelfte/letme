@@ -113,6 +113,15 @@ ci = ["lint", "typecheck", "test", "build"]
 User aliases can also override the built-in `ok`. Colors can be themed with
 palette files; see [docs/theming.md](docs/theming.md).
 
+### Disabling commands per project
+
+To keep a detected command from running in a specific repo, drop a
+`.letme.local.toml` next to the code:
+
+```toml
+disable = ["format"]
+```
+
 ## Status
 
 I built this for my own daily work and it is early. Things to know:

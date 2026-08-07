@@ -1,12 +1,15 @@
 use anyhow::{Result, bail};
 use owo_colors::OwoColorize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
+use crate::cli::Cli;
 use crate::config::Config;
 use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
 use crate::doctor;
+use crate::local_config::{FILE_NAME, LocalConfig};
 use crate::summary::{self, Outcome, SummaryRow};
 use crate::theme::{Theme, sanitize};
 
@@ -27,20 +30,20 @@ impl std::error::Error for CommandExit {}
 enum PlanEntry<'a> {
     Doctor,
     NotDetected(CanonicalCommand),
+    Disabled(CanonicalCommand),
     Exec(&'a ResolvedCommand),
 }
 
 pub fn run(
     dir: &Path,
     groups: &[DetectorGroup],
-    names: &[String],
-    interactive: bool,
-    verbose: bool,
+    cli: &Cli,
     theme: &Theme,
     config: &Config,
+    local: &LocalConfig,
 ) -> Result<()> {
     let expanded = config
-        .expand_aliases(names)
+        .expand_aliases(&cli.commands)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let canonicals: Vec<CanonicalCommand> = expanded
@@ -48,13 +51,14 @@ pub fn run(
         .filter(|n| *n != "doctor")
         .filter_map(|n| n.parse().ok())
         .collect();
+    let canonicals = local.enabled(&canonicals, cli.verbose);
 
     // Resolve all canonical commands in one pass (avoids redundant detect() calls)
-    let resolved = detect::resolve_all(groups, dir, &canonicals, verbose);
+    let resolved = detect::resolve_all(groups, dir, &canonicals, cli.verbose);
 
     let chained = expanded.len() > 1;
-    let plan = build_plan(&expanded, &resolved, chained)?;
-    let (rows, failure) = execute_plan(&plan, dir, groups, interactive, theme)?;
+    let plan = build_plan(&expanded, &resolved, chained, &local.disabled)?;
+    let (rows, failure) = execute_plan(&plan, dir, groups, cli.interactive, theme)?;
 
     if summary::should_print(&rows) {
         println!();
@@ -71,6 +75,7 @@ fn build_plan<'a>(
     expanded: &[String],
     resolved: &'a [ResolvedCommand],
     chained: bool,
+    disabled: &HashSet<CanonicalCommand>,
 ) -> Result<Vec<PlanEntry<'a>>> {
     let mut plan = Vec::new();
     for name in expanded {
@@ -80,6 +85,17 @@ fn build_plan<'a>(
         }
 
         let canonical: CanonicalCommand = name.parse().unwrap();
+
+        // Checked before resolution: disabled commands never reach resolve_all,
+        // so an empty match must not fall through to "not detected"
+        if disabled.contains(&canonical) {
+            if chained {
+                plan.push(PlanEntry::Disabled(canonical));
+                continue;
+            }
+            bail!("{canonical} is disabled by {FILE_NAME}.");
+        }
+
         let cmds: Vec<&ResolvedCommand> = resolved
             .iter()
             .filter(|r| r.canonical == canonical)
@@ -145,6 +161,20 @@ fn execute_plan(
                     name: canonical.to_string(),
                     cmd: None,
                     outcome: Outcome::NotDetected,
+                });
+            }
+            PlanEntry::Disabled(canonical) => {
+                if failure.is_none() {
+                    eprintln!(
+                        "  {} {}",
+                        "⊘".style(theme.muted),
+                        format!("{canonical} disabled by {FILE_NAME}, skipping").style(theme.muted),
+                    );
+                }
+                rows.push(SummaryRow {
+                    name: canonical.to_string(),
+                    cmd: None,
+                    outcome: Outcome::Disabled,
                 });
             }
             PlanEntry::Exec(cmd) => {
@@ -247,7 +277,8 @@ mod tests {
             rc(CanonicalCommand::Test, "pnpm test"),
             rc(CanonicalCommand::Build, "cargo build"),
         ];
-        let plan = build_plan(&names(&["test", "build"]), &resolved, true).unwrap();
+        let plan =
+            build_plan(&names(&["test", "build"]), &resolved, true, &HashSet::new()).unwrap();
         let cmds: Vec<&str> = plan
             .iter()
             .map(|entry| match entry {
@@ -261,7 +292,7 @@ mod tests {
     #[test]
     fn build_plan_marks_undetected_in_chains() {
         let resolved = vec![rc(CanonicalCommand::Test, "cargo test")];
-        let plan = build_plan(&names(&["e2e", "test"]), &resolved, true).unwrap();
+        let plan = build_plan(&names(&["e2e", "test"]), &resolved, true, &HashSet::new()).unwrap();
         assert!(matches!(
             plan[0],
             PlanEntry::NotDetected(CanonicalCommand::E2e)
@@ -271,8 +302,53 @@ mod tests {
 
     #[test]
     fn build_plan_errors_for_single_undetected_name() {
-        let err = build_plan(&names(&["e2e"]), &[], false).unwrap_err();
+        let err = build_plan(&names(&["e2e"]), &[], false, &HashSet::new()).unwrap_err();
         assert_eq!(err.to_string(), "No e2e command detected.");
+    }
+
+    #[test]
+    fn build_plan_marks_disabled_in_chains() {
+        let resolved = vec![rc(CanonicalCommand::Test, "cargo test")];
+        let disabled = HashSet::from([CanonicalCommand::Format]);
+        let plan = build_plan(&names(&["format", "test"]), &resolved, true, &disabled).unwrap();
+        assert!(matches!(
+            plan[0],
+            PlanEntry::Disabled(CanonicalCommand::Format)
+        ));
+        assert!(matches!(plan[1], PlanEntry::Exec(_)));
+    }
+
+    #[test]
+    fn build_plan_errors_for_single_disabled_name() {
+        let disabled = HashSet::from([CanonicalCommand::Format]);
+        let err = build_plan(&names(&["format"]), &[], false, &disabled).unwrap_err();
+        assert_eq!(err.to_string(), "format is disabled by .letme.local.toml.");
+    }
+
+    #[test]
+    fn build_plan_disabled_beats_not_detected() {
+        // Disabled commands are filtered out before resolution, so they are
+        // always absent from `resolved` — the disabled check must win
+        let disabled = HashSet::from([CanonicalCommand::Format]);
+        let err = build_plan(&names(&["format"]), &[], false, &disabled).unwrap_err();
+        assert!(err.to_string().contains("disabled"), "got: {err}");
+    }
+
+    #[test]
+    fn execute_plan_records_disabled_rows() {
+        let resolved = rc(CanonicalCommand::Test, "true");
+        let plan = vec![
+            PlanEntry::Disabled(CanonicalCommand::Format),
+            PlanEntry::Exec(&resolved),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let (rows, failure) = execute_plan(&plan, dir.path(), &[], false, &Theme::plain()).unwrap();
+
+        assert_eq!(failure, None);
+        assert_eq!(rows[0].name, "format");
+        assert_eq!(rows[0].cmd, None);
+        assert_eq!(rows[0].outcome, Outcome::Disabled);
+        assert!(matches!(rows[1].outcome, Outcome::Success { .. }));
     }
 
     #[test]

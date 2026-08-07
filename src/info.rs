@@ -1,10 +1,11 @@
 use anyhow::Result;
 use owo_colors::OwoColorize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::config::Config;
 use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
+use crate::local_config::{FILE_NAME, LocalConfig};
 use crate::theme::{Theme, sanitize};
 
 pub fn show(
@@ -13,6 +14,7 @@ pub fn show(
     verbose: bool,
     theme: &Theme,
     config: &Config,
+    local: &LocalConfig,
 ) -> Result<()> {
     // Find which detectors match (respecting exclusive groups)
     let mut detected: Vec<(&str, detect::Ecosystem)> = Vec::new();
@@ -62,7 +64,8 @@ pub fn show(
 
     println!();
 
-    let resolved = detect::resolve_all(groups, dir, CanonicalCommand::all(), verbose);
+    let commands = local.enabled(CanonicalCommand::all(), verbose);
+    let resolved = detect::resolve_all(groups, dir, &commands, verbose);
 
     let mut by_command: BTreeMap<String, Vec<&ResolvedCommand>> = BTreeMap::new();
     for cmd in &resolved {
@@ -72,39 +75,77 @@ pub fn show(
             .push(cmd);
     }
 
-    if by_command.is_empty() {
+    let disabled: BTreeSet<String> = local.disabled.iter().map(|c| c.to_string()).collect();
+
+    if by_command.is_empty() && disabled.is_empty() {
         println!("{}", "No canonical commands resolved.".style(theme.muted));
         return Ok(());
     }
 
     println!("{}", "Available commands:".style(theme.header));
-    for (name, cmds) in &by_command {
-        println!(
-            "  {} {}",
+    print!("{}", render_commands(&by_command, &disabled, theme));
+
+    let aliases = config.effective_aliases();
+    show_aliases(&aliases, &by_command, theme);
+
+    Ok(())
+}
+
+fn render_commands(
+    by_command: &BTreeMap<String, Vec<&ResolvedCommand>>,
+    disabled: &BTreeSet<String>,
+    theme: &Theme,
+) -> String {
+    let names: BTreeSet<&str> = by_command
+        .keys()
+        .chain(disabled.iter())
+        .map(String::as_str)
+        .collect();
+
+    let mut out = String::new();
+    for name in names {
+        if disabled.contains(name) {
+            out.push_str(&format!(
+                "  {} {}\n    {} {}\n",
+                "letme".style(theme.muted),
+                name.style(theme.disabled),
+                "⊘".style(theme.muted),
+                format!("disabled ({FILE_NAME})").style(theme.muted),
+            ));
+            continue;
+        }
+        out.push_str(&format!(
+            "  {} {}\n",
             "letme".style(theme.muted),
             name.style(theme.command)
-        );
-        for cmd in cmds {
+        ));
+        for cmd in &by_command[name] {
             if cmd.label != cmd.cmd {
-                println!(
-                    "    {} {} {} {}",
+                out.push_str(&format!(
+                    "    {} {} {} {}\n",
                     "→".style(theme.accent),
                     sanitize(&cmd.cmd).style(theme.info),
                     format!("({})", sanitize(&cmd.label)).style(theme.muted),
                     format!("[{}, {}]", cmd.tier, cmd.detector_name).style(theme.muted),
-                );
+                ));
             } else {
-                println!(
-                    "    {} {} {}",
+                out.push_str(&format!(
+                    "    {} {} {}\n",
                     "→".style(theme.accent),
                     sanitize(&cmd.cmd).style(theme.info),
                     format!("[{}, {}]", cmd.tier, cmd.detector_name).style(theme.muted),
-                );
+                ));
             }
         }
     }
+    out
+}
 
-    let aliases = config.effective_aliases();
+fn show_aliases(
+    aliases: &std::collections::HashMap<String, Vec<String>>,
+    by_command: &BTreeMap<String, Vec<&ResolvedCommand>>,
+    theme: &Theme,
+) {
     if !aliases.is_empty() {
         println!();
         println!("{}", "Aliases:".style(theme.header));
@@ -130,6 +171,45 @@ pub fn show(
             );
         }
     }
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::{Ecosystem, Tier};
+
+    fn rc(canonical: CanonicalCommand, cmd: &str) -> ResolvedCommand {
+        ResolvedCommand {
+            canonical,
+            cmd: cmd.to_string(),
+            label: cmd.to_string(),
+            tier: Tier::Tier4,
+            ecosystem: Ecosystem::Rust,
+            detector_name: "test".to_string(),
+            priority: 10,
+        }
+    }
+
+    #[test]
+    fn render_commands_shows_disabled_row_with_source() {
+        let test_cmd = rc(CanonicalCommand::Test, "cargo test");
+        let by_command = BTreeMap::from([("test".to_string(), vec![&test_cmd])]);
+        let disabled = BTreeSet::from(["format".to_string()]);
+        let out = render_commands(&by_command, &disabled, &Theme::plain());
+
+        let expected = "  letme format
+    ⊘ disabled (.letme.local.toml)
+  letme test
+    → cargo test [convention, test]
+";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn render_commands_handles_all_disabled_project() {
+        let disabled = BTreeSet::from(["format".to_string()]);
+        let out = render_commands(&BTreeMap::new(), &disabled, &Theme::plain());
+        assert!(out.contains("letme format"), "got: {out}");
+        assert!(out.contains("disabled (.letme.local.toml)"), "got: {out}");
+    }
 }

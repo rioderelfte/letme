@@ -21,6 +21,7 @@ pub enum Outcome {
         code: Option<i32>,
     },
     NotDetected,
+    Disabled,
     Declined,
     NotRun,
 }
@@ -34,7 +35,7 @@ pub struct SummaryRow {
 
 pub fn should_print(rows: &[SummaryRow]) -> bool {
     rows.iter()
-        .filter(|r| !matches!(r.outcome, Outcome::NotDetected))
+        .filter(|r| !matches!(r.outcome, Outcome::NotDetected | Outcome::Disabled))
         .count()
         > 1
 }
@@ -109,6 +110,7 @@ struct Cells<'a> {
 fn to_cells(row: &SummaryRow) -> Cells<'_> {
     let cmd = match (&row.outcome, &row.cmd) {
         (Outcome::NotDetected, _) => "not detected".to_string(),
+        (Outcome::Disabled, _) => "disabled".to_string(),
         (_, Some(cmd)) => truncate_to_width(&sanitize(cmd), MAX_CMD_WIDTH),
         (_, None) => String::new(),
     };
@@ -122,6 +124,7 @@ fn to_cells(row: &SummaryRow) -> Cells<'_> {
             ("✗", format_duration(*duration), Some(annotation))
         }
         Outcome::NotDetected => ("⊘", String::new(), None),
+        Outcome::Disabled => ("⊘", String::new(), None),
         Outcome::Declined => ("⊘", "declined".to_string(), None),
         Outcome::NotRun => ("⊘", "not run".to_string(), None),
     };
@@ -217,6 +220,7 @@ mod tests {
                 },
             ),
             row("typecheck", None, Outcome::NotDetected),
+            row("clean", None, Outcome::Disabled),
             row("build", Some("cargo build"), Outcome::NotRun),
             row("e2e", Some("pnpm exec playwright test"), Outcome::Declined),
         ]
@@ -230,6 +234,7 @@ mod tests {
 ✓ lint       cargo clippy                   8.4s
 ✗ test       cargo test                    12.1s  exit 101
 ⊘ typecheck  not detected
+⊘ clean      disabled
 ⊘ build      cargo build                 not run
 ⊘ e2e        pnpm exec playwright test  declined
 ";
@@ -332,6 +337,7 @@ mod tests {
     fn should_print_needs_more_than_one_subprocess_row() {
         let exec = || row("test", Some("cargo test"), success(10));
         let not_detected = || row("e2e", None, Outcome::NotDetected);
+        let disabled = || row("format", None, Outcome::Disabled);
 
         assert!(!should_print(&[exec()]));
         assert!(should_print(&[exec(), exec()]));
@@ -341,6 +347,7 @@ mod tests {
             not_detected(),
             not_detected()
         ]));
+        assert!(!should_print(&[exec(), disabled(), disabled()]));
         assert!(should_print(&[
             row("doctor", Some("health checks"), success(10)),
             exec()
