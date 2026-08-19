@@ -129,6 +129,7 @@ pub struct ResolvedCommand {
     pub ecosystem: Ecosystem,
     pub detector_name: String,
     pub priority: u32,
+    pub covered_by: Option<CanonicalCommand>,
 }
 
 /// Trait implemented by all detectors.
@@ -164,6 +165,22 @@ pub trait Detector {
             ecosystem: self.ecosystem(),
             detector_name: self.name().into(),
             priority,
+            covered_by: None,
+        }
+    }
+
+    /// Helper for a command another canonical command of this detector already
+    /// covers, like `cargo check` under `cargo clippy`.
+    fn make_covered_command(
+        &self,
+        canonical: CanonicalCommand,
+        cmd: String,
+        priority: u32,
+        covered_by: CanonicalCommand,
+    ) -> ResolvedCommand {
+        ResolvedCommand {
+            covered_by: Some(covered_by),
+            ..self.make_command(canonical, cmd, priority)
         }
     }
 }

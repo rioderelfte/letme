@@ -31,6 +31,10 @@ enum PlanEntry<'a> {
     Doctor,
     NotDetected(CanonicalCommand),
     Disabled(CanonicalCommand),
+    Covered {
+        canonical: CanonicalCommand,
+        by: &'a ResolvedCommand,
+    },
     Exec(&'a ResolvedCommand),
 }
 
@@ -109,9 +113,22 @@ fn build_plan<'a>(
             bail!("No {canonical} command detected.");
         }
 
-        plan.extend(cmds.into_iter().map(PlanEntry::Exec));
+        plan.extend(cmds.into_iter().map(|cmd| match coverer(resolved, cmd) {
+            Some(by) => PlanEntry::Covered { canonical, by },
+            None => PlanEntry::Exec(cmd),
+        }));
     }
     Ok(plan)
+}
+
+fn coverer<'a>(
+    resolved: &'a [ResolvedCommand],
+    cmd: &ResolvedCommand,
+) -> Option<&'a ResolvedCommand> {
+    let covered_by = cmd.covered_by?;
+    resolved
+        .iter()
+        .find(|r| r.canonical == covered_by && r.detector_name == cmd.detector_name)
 }
 
 fn execute_plan(
@@ -175,6 +192,21 @@ fn execute_plan(
                     name: canonical.to_string(),
                     cmd: None,
                     outcome: Outcome::Disabled,
+                });
+            }
+            PlanEntry::Covered { canonical, by } => {
+                if failure.is_none() {
+                    eprintln!(
+                        "  {} {}",
+                        "⊘".style(theme.muted),
+                        format!("{canonical} covered by {}, skipping", sanitize(&by.cmd))
+                            .style(theme.muted),
+                    );
+                }
+                rows.push(SummaryRow {
+                    name: canonical.to_string(),
+                    cmd: None,
+                    outcome: Outcome::Covered { by: by.cmd.clone() },
                 });
             }
             PlanEntry::Exec(cmd) => {
@@ -263,6 +295,20 @@ mod tests {
             ecosystem: Ecosystem::Rust,
             detector_name: "test".to_string(),
             priority: 10,
+            covered_by: None,
+        }
+    }
+
+    fn covered(
+        canonical: CanonicalCommand,
+        cmd: &str,
+        by: CanonicalCommand,
+        detector: &str,
+    ) -> ResolvedCommand {
+        ResolvedCommand {
+            covered_by: Some(by),
+            detector_name: detector.to_string(),
+            ..rc(canonical, cmd)
         }
     }
 
@@ -332,6 +378,97 @@ mod tests {
         let disabled = HashSet::from([CanonicalCommand::Format]);
         let err = build_plan(&names(&["format"]), &[], false, &disabled).unwrap_err();
         assert!(err.to_string().contains("disabled"), "got: {err}");
+    }
+
+    #[test]
+    fn build_plan_skips_covered_command_when_its_coverer_runs() {
+        let resolved = vec![
+            rc(CanonicalCommand::Lint, "cargo clippy"),
+            covered(
+                CanonicalCommand::Typecheck,
+                "cargo check",
+                CanonicalCommand::Lint,
+                "test",
+            ),
+        ];
+        let plan = build_plan(
+            &names(&["lint", "typecheck"]),
+            &resolved,
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(plan[0], PlanEntry::Exec(_)));
+        assert!(matches!(
+            plan[1],
+            PlanEntry::Covered {
+                canonical: CanonicalCommand::Typecheck,
+                by,
+            } if by.cmd == "cargo clippy"
+        ));
+    }
+
+    #[test]
+    fn build_plan_runs_covered_command_on_its_own() {
+        let resolved = vec![covered(
+            CanonicalCommand::Typecheck,
+            "cargo check",
+            CanonicalCommand::Lint,
+            "test",
+        )];
+        let plan = build_plan(&names(&["typecheck"]), &resolved, false, &HashSet::new()).unwrap();
+
+        assert!(matches!(plan[0], PlanEntry::Exec(c) if c.cmd == "cargo check"));
+    }
+
+    #[test]
+    fn build_plan_ignores_a_coverer_from_another_detector() {
+        // `just lint` may or may not type-check; only the detector that owns
+        // both commands knows they overlap
+        let resolved = vec![
+            rc(CanonicalCommand::Lint, "just lint"),
+            covered(
+                CanonicalCommand::Typecheck,
+                "cargo check",
+                CanonicalCommand::Lint,
+                "cargo",
+            ),
+        ];
+        let plan = build_plan(
+            &names(&["lint", "typecheck"]),
+            &resolved,
+            true,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(plan.iter().all(|e| matches!(e, PlanEntry::Exec(_))));
+    }
+
+    #[test]
+    fn execute_plan_records_covered_rows() {
+        let lint = rc(CanonicalCommand::Lint, "true");
+        let plan = vec![
+            PlanEntry::Exec(&lint),
+            PlanEntry::Covered {
+                canonical: CanonicalCommand::Typecheck,
+                by: &lint,
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let (rows, failure) = execute_plan(&plan, dir.path(), &[], false, &Theme::plain()).unwrap();
+
+        assert_eq!(failure, None);
+        assert!(matches!(rows[0].outcome, Outcome::Success { .. }));
+        assert_eq!(rows[1].name, "typecheck");
+        assert_eq!(rows[1].cmd, None);
+        assert_eq!(
+            rows[1].outcome,
+            Outcome::Covered {
+                by: "true".to_string()
+            }
+        );
     }
 
     #[test]

@@ -187,6 +187,7 @@ mod tests {
             ecosystem: Ecosystem::Rust,
             detector_name: "test".to_string(),
             priority: 10,
+            covered_by: None,
         }
     }
 

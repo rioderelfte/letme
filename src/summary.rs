@@ -22,6 +22,9 @@ pub enum Outcome {
     },
     NotDetected,
     Disabled,
+    Covered {
+        by: String,
+    },
     Declined,
     NotRun,
 }
@@ -35,7 +38,12 @@ pub struct SummaryRow {
 
 pub fn should_print(rows: &[SummaryRow]) -> bool {
     rows.iter()
-        .filter(|r| !matches!(r.outcome, Outcome::NotDetected | Outcome::Disabled))
+        .filter(|r| {
+            !matches!(
+                r.outcome,
+                Outcome::NotDetected | Outcome::Disabled | Outcome::Covered { .. }
+            )
+        })
         .count()
         > 1
 }
@@ -111,6 +119,9 @@ fn to_cells(row: &SummaryRow) -> Cells<'_> {
     let cmd = match (&row.outcome, &row.cmd) {
         (Outcome::NotDetected, _) => "not detected".to_string(),
         (Outcome::Disabled, _) => "disabled".to_string(),
+        (Outcome::Covered { by }, _) => {
+            truncate_to_width(&format!("covered by {}", sanitize(by)), MAX_CMD_WIDTH)
+        }
         (_, Some(cmd)) => truncate_to_width(&sanitize(cmd), MAX_CMD_WIDTH),
         (_, None) => String::new(),
     };
@@ -125,6 +136,7 @@ fn to_cells(row: &SummaryRow) -> Cells<'_> {
         }
         Outcome::NotDetected => ("⊘", String::new(), None),
         Outcome::Disabled => ("⊘", String::new(), None),
+        Outcome::Covered { .. } => ("⊘", String::new(), None),
         Outcome::Declined => ("⊘", "declined".to_string(), None),
         Outcome::NotRun => ("⊘", "not run".to_string(), None),
     };
@@ -212,6 +224,13 @@ mod tests {
             row("format", Some("cargo fmt"), success(200)),
             row("lint", Some("cargo clippy"), success(8_400)),
             row(
+                "typecheck",
+                None,
+                Outcome::Covered {
+                    by: "cargo clippy".to_string(),
+                },
+            ),
+            row(
                 "test",
                 Some("cargo test"),
                 Outcome::Failure {
@@ -219,7 +238,7 @@ mod tests {
                     code: Some(101),
                 },
             ),
-            row("typecheck", None, Outcome::NotDetected),
+            row("install", None, Outcome::NotDetected),
             row("clean", None, Outcome::Disabled),
             row("build", Some("cargo build"), Outcome::NotRun),
             row("e2e", Some("pnpm exec playwright test"), Outcome::Declined),
@@ -232,8 +251,9 @@ mod tests {
 ─ summary ────────────────────────────────────────────────
 ✓ format     cargo fmt                      0.2s
 ✓ lint       cargo clippy                   8.4s
+⊘ typecheck  covered by cargo clippy
 ✗ test       cargo test                    12.1s  exit 101
-⊘ typecheck  not detected
+⊘ install    not detected
 ⊘ clean      disabled
 ⊘ build      cargo build                 not run
 ⊘ e2e        pnpm exec playwright test  declined
@@ -338,9 +358,19 @@ mod tests {
         let exec = || row("test", Some("cargo test"), success(10));
         let not_detected = || row("e2e", None, Outcome::NotDetected);
         let disabled = || row("format", None, Outcome::Disabled);
+        let covered = || {
+            row(
+                "typecheck",
+                None,
+                Outcome::Covered {
+                    by: "cargo clippy".to_string(),
+                },
+            )
+        };
 
         assert!(!should_print(&[exec()]));
         assert!(should_print(&[exec(), exec()]));
+        assert!(!should_print(&[exec(), covered()]));
         assert!(!should_print(&[
             exec(),
             not_detected(),
