@@ -20,7 +20,7 @@ or `npm run test:unit` costs a little time and focus, twenty times a day.
 letme test          # run the detected test command
 letme lint test     # chain commands; stops on the first failure
 letme te            # unambiguous prefixes work too
-letme ok            # built-in alias: format, lint, typecheck, test
+letme ok            # your own alias, see Configuration
 letme clean -i      # confirm each command before it runs
 ```
 
@@ -106,12 +106,14 @@ Optional, lives at `~/.config/letme/config.toml`:
 
 ```toml
 [aliases]
-t  = ["test"]                              # make the ambiguous "t" prefix work
+ok = ["format", "lint", "typecheck", "test"]   # what I run before every commit
+t  = ["test"]                                  # make the ambiguous "t" prefix work
 ci = ["lint", "typecheck", "test", "build"]
 ```
 
-User aliases can also override the built-in `ok`. Colors can be themed with
-palette files; see [docs/theming.md](docs/theming.md).
+Aliases may reference other aliases, and their names take part in prefix
+matching. Colors can be themed with palette files; see
+[docs/theming.md](docs/theming.md).
 
 ### Disabling commands per project
 

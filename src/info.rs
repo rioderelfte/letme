@@ -85,8 +85,7 @@ pub fn show(
     println!("{}", "Available commands:".style(theme.header));
     print!("{}", render_commands(&by_command, &disabled, theme));
 
-    let aliases = config.effective_aliases();
-    show_aliases(&aliases, &by_command, theme);
+    show_aliases(&config.aliases, &by_command, theme);
 
     Ok(())
 }

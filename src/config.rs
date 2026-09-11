@@ -14,16 +14,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Return aliases with built-in defaults merged under user overrides.
-    /// User entries override built-in entries with the same key.
-    pub fn effective_aliases(&self) -> HashMap<String, Vec<String>> {
-        let mut merged = default_aliases();
-        for (k, v) in &self.aliases {
-            merged.insert(k.clone(), v.clone());
-        }
-        merged
-    }
-
     /// Resolve a user-provided name to an exact command or alias name.
     ///
     /// Resolution order:
@@ -84,13 +74,13 @@ impl Config {
     /// cycles are an error. Duplicates are removed (first occurrence wins).
     /// Supports unambiguous prefix matching (e.g. "te" resolves to "test", "i" to "install").
     pub fn expand_aliases(&self, names: &[String]) -> Result<Vec<String>, String> {
-        let aliases = self.effective_aliases();
+        let aliases = &self.aliases;
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
         for name in names {
-            let resolved = self.resolve_name(name, &aliases)?;
-            expand_into(&resolved, &aliases, &mut Vec::new(), &mut seen, &mut result)?;
+            let resolved = self.resolve_name(name, aliases)?;
+            expand_into(&resolved, aliases, &mut Vec::new(), &mut seen, &mut result)?;
         }
 
         Ok(result)
@@ -107,12 +97,7 @@ fn expand_into(
     if let Some(expansion) = aliases.get(name) {
         if visiting.iter().any(|v| v == name) {
             return Err(if visiting.last().is_some_and(|v| v == name) {
-                let hint = if default_aliases().contains_key(name) {
-                    " To extend the built-in alias, list its commands explicitly."
-                } else {
-                    ""
-                };
-                format!("Alias '{name}' references itself.{hint}")
+                format!("Alias '{name}' references itself.")
             } else {
                 format!("Alias cycle: {} -> {name}", visiting.join(" -> "))
             });
@@ -137,20 +122,6 @@ fn expand_into(
         ));
     }
     Ok(())
-}
-
-fn default_aliases() -> HashMap<String, Vec<String>> {
-    let mut m = HashMap::new();
-    m.insert(
-        "ok".into(),
-        vec![
-            "format".into(),
-            "lint".into(),
-            "typecheck".into(),
-            "test".into(),
-        ],
-    );
-    m
 }
 
 pub fn load_config() -> Config {
@@ -178,56 +149,43 @@ pub fn dirs_base() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn user_override_replaces_default() {
-        let config = Config {
-            aliases: HashMap::from([("ok".into(), vec!["lint".into(), "test".into()])]),
+    fn config_with(aliases: &[(&str, &[&str])]) -> Config {
+        Config {
+            aliases: aliases
+                .iter()
+                .map(|(name, expansion)| {
+                    (
+                        (*name).to_string(),
+                        expansion.iter().map(|c| (*c).to_string()).collect(),
+                    )
+                })
+                .collect(),
             ..Default::default()
-        };
-        let aliases = config.effective_aliases();
-        assert_eq!(
-            aliases.get("ok"),
-            Some(&vec!["lint".to_string(), "test".to_string()])
-        );
-    }
-
-    #[test]
-    fn user_can_add_new_alias() {
-        let config = Config {
-            aliases: HashMap::from([("ci".into(), vec!["lint".into(), "test".into()])]),
-            ..Default::default()
-        };
-        let aliases = config.effective_aliases();
-        assert!(aliases.contains_key("ok")); // built-in preserved
-        assert_eq!(
-            aliases.get("ci"),
-            Some(&vec!["lint".to_string(), "test".to_string()])
-        );
+        }
     }
 
     #[test]
     fn expand_simple_alias() {
-        let config = Config::default();
-        let result = config.expand_aliases(&["ok".into()]).unwrap();
+        let config = config_with(&[("ci", &["format", "lint", "typecheck", "test"])]);
+        let result = config.expand_aliases(&["ci".into()]).unwrap();
         assert_eq!(result, vec!["format", "lint", "typecheck", "test"]);
     }
 
     #[test]
     fn expand_deduplicates_preserving_order() {
-        let config = Config::default();
-        // ok expands to [format, lint, typecheck, test], then test is a duplicate
+        let config = config_with(&[("ci", &["format", "lint", "typecheck", "test"])]);
         let result = config
-            .expand_aliases(&["ok".into(), "test".into()])
+            .expand_aliases(&["ci".into(), "test".into()])
             .unwrap();
         assert_eq!(result, vec!["format", "lint", "typecheck", "test"]);
     }
 
     #[test]
-    fn expand_test_then_ok_preserves_first_occurrence() {
-        let config = Config::default();
-        // test comes first; the trailing test from ok's expansion is deduped
+    fn expand_command_then_alias_preserves_first_occurrence() {
+        let config = config_with(&[("ci", &["format", "lint", "typecheck", "test"])]);
+        // test comes first; the trailing test from ci's expansion is deduped
         let result = config
-            .expand_aliases(&["test".into(), "ok".into()])
+            .expand_aliases(&["test".into(), "ci".into()])
             .unwrap();
         assert_eq!(result, vec!["test", "format", "lint", "typecheck"]);
     }
@@ -241,65 +199,41 @@ mod tests {
 
     #[test]
     fn expand_nested_alias() {
-        let config = Config {
-            aliases: HashMap::from([("full".into(), vec!["ok".into(), "build".into()])]),
-            ..Default::default()
-        };
+        let config = config_with(&[
+            ("ci", &["format", "lint", "typecheck", "test"]),
+            ("full", &["ci", "build"]),
+        ]);
         let result = config.expand_aliases(&["full".into()]).unwrap();
         assert_eq!(result, vec!["format", "lint", "typecheck", "test", "build"]);
     }
 
     #[test]
     fn expand_nested_alias_deduplicates() {
-        let config = Config {
-            aliases: HashMap::from([("full".into(), vec!["test".into(), "ok".into()])]),
-            ..Default::default()
-        };
+        let config = config_with(&[
+            ("ci", &["format", "lint", "typecheck", "test"]),
+            ("full", &["test", "ci"]),
+        ]);
         let result = config.expand_aliases(&["full".into()]).unwrap();
         assert_eq!(result, vec!["test", "format", "lint", "typecheck"]);
     }
 
     #[test]
     fn expand_doctor_in_alias_value() {
-        let config = Config {
-            aliases: HashMap::from([("checkup".into(), vec!["doctor".into(), "test".into()])]),
-            ..Default::default()
-        };
+        let config = config_with(&[("checkup", &["doctor", "test"])]);
         let result = config.expand_aliases(&["checkup".into()]).unwrap();
         assert_eq!(result, vec!["doctor", "test"]);
     }
 
     #[test]
     fn self_referencing_alias_errors() {
-        let config = Config {
-            aliases: HashMap::from([("ok".into(), vec!["ok".into(), "e2e".into()])]),
-            ..Default::default()
-        };
-        let err = config.expand_aliases(&["ok".into()]).unwrap_err();
-        assert!(err.contains("Alias 'ok' references itself"), "got: {err}");
-        assert!(err.contains("built-in"), "got: {err}");
-    }
-
-    #[test]
-    fn self_referencing_user_alias_errors_without_builtin_hint() {
-        let config = Config {
-            aliases: HashMap::from([("foo".into(), vec!["foo".into()])]),
-            ..Default::default()
-        };
+        let config = config_with(&[("foo", &["foo", "e2e"])]);
         let err = config.expand_aliases(&["foo".into()]).unwrap_err();
         assert!(err.contains("Alias 'foo' references itself"), "got: {err}");
-        assert!(!err.contains("built-in"), "got: {err}");
     }
 
     #[test]
     fn alias_cycle_errors() {
-        let config = Config {
-            aliases: HashMap::from([
-                ("a".into(), vec!["b".into()]),
-                ("b".into(), vec!["a".into()]),
-            ]),
-            ..Default::default()
-        };
+        let config = config_with(&[("a", &["b"]), ("b", &["a"])]);
         let err = config.expand_aliases(&["a".into()]).unwrap_err();
         assert!(err.contains("Alias cycle: a -> b -> a"), "got: {err}");
     }
@@ -307,10 +241,7 @@ mod tests {
     #[test]
     fn prefix_in_alias_value_errors() {
         // Alias values must be exact names; prefixes only resolve on the command line
-        let config = Config {
-            aliases: HashMap::from([("ci".into(), vec!["te".into()])]),
-            ..Default::default()
-        };
+        let config = config_with(&[("ci", &["te"])]);
         let err = config.expand_aliases(&["ci".into()]).unwrap_err();
         assert!(err.contains("Unknown command: te"), "got: {err}");
         assert!(err.contains("in alias 'ci'"), "got: {err}");
@@ -318,10 +249,7 @@ mod tests {
 
     #[test]
     fn expand_invalid_value_errors() {
-        let config = Config {
-            aliases: HashMap::from([("bad".into(), vec!["nonexistent".into()])]),
-            ..Default::default()
-        };
+        let config = config_with(&[("bad", &["nonexistent"])]);
         let result = config.expand_aliases(&["bad".into()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown command"));
@@ -375,19 +303,16 @@ mod tests {
     }
 
     #[test]
-    fn prefix_o_resolves_to_alias_ok() {
-        let config = Config::default();
-        let result = config.expand_aliases(&["o".into()]).unwrap();
-        assert_eq!(result, vec!["format", "lint", "typecheck", "test"]);
+    fn prefix_resolves_to_alias() {
+        let config = config_with(&[("verify", &["lint", "test"])]);
+        let result = config.expand_aliases(&["v".into()]).unwrap();
+        assert_eq!(result, vec!["lint", "test"]);
     }
 
     #[test]
     fn prefix_ambiguous_errors() {
-        // With a user alias "ci" next to the built-in "clean", "c" is ambiguous
-        let config = Config {
-            aliases: HashMap::from([("ci".into(), vec!["lint".into(), "test".into()])]),
-            ..Default::default()
-        };
+        // With a user alias "ci" next to the canonical "clean", "c" is ambiguous
+        let config = config_with(&[("ci", &["lint", "test"])]);
         let result = config.expand_aliases(&["c".into()]);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -429,13 +354,6 @@ ci = ["build", "test"]
         assert_eq!(
             config.aliases.get("ci"),
             Some(&vec!["build".to_string(), "test".to_string()])
-        );
-
-        // effective_aliases should use user's ok, not default
-        let effective = config.effective_aliases();
-        assert_eq!(
-            effective.get("ok"),
-            Some(&vec!["lint".to_string(), "test".to_string()])
         );
     }
 }
