@@ -17,14 +17,10 @@ Canonical commands (chainable):
   clean      Remove build artifacts/dependencies
   doctor     Diagnose project health
 
-Built-in aliases:
-  ok         Expands to: format, lint, typecheck, test
-
 Examples:
   letme              Show detected project info
   letme test         Run test command(s)
   letme test lint    Chain multiple commands
-  letme ok           Run format + lint + typecheck + test
   letme clean -i     Interactive mode (confirm each action)
   letme doctor       Project health checker"
 )]
