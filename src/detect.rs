@@ -1,18 +1,17 @@
 use std::fmt;
 use std::path::Path;
-use std::str::FromStr;
 
 use crate::theme::sanitize;
 
-/// Canonical commands that letme understands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Canonical commands that letme understands. Declaration order is display
+/// order, for the help page and the info view alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CanonicalCommand {
     Install,
     Test,
     E2e,
     Lint,
     Typecheck,
-    Fix,
     Format,
     Build,
     Clean,
@@ -26,7 +25,6 @@ impl CanonicalCommand {
             Self::E2e,
             Self::Lint,
             Self::Typecheck,
-            Self::Fix,
             Self::Format,
             Self::Build,
             Self::Clean,
@@ -41,43 +39,112 @@ impl CanonicalCommand {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Test => "test",
+            Self::E2e => "e2e",
+            Self::Lint => "lint",
+            Self::Typecheck => "typecheck",
+            Self::Format => "format",
+            Self::Build => "build",
+            Self::Clean => "clean",
+        }
+    }
+
+    /// Parse an exact name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|c| c.as_str() == name)
+    }
 }
 
 impl fmt::Display for CanonicalCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A modifier that refines a canonical command's detection key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Modifier {
+    Check,
+    Fix,
+}
+
+impl Modifier {
+    pub fn flag(self) -> &'static str {
         match self {
-            Self::Install => write!(f, "install"),
-            Self::Test => write!(f, "test"),
-            Self::E2e => write!(f, "e2e"),
-            Self::Lint => write!(f, "lint"),
-            Self::Typecheck => write!(f, "typecheck"),
-            Self::Fix => write!(f, "fix"),
-            Self::Format => write!(f, "format"),
-            Self::Build => write!(f, "build"),
-            Self::Clean => write!(f, "clean"),
+            Self::Check => "--check",
+            Self::Fix => "--fix",
         }
     }
 }
 
-impl FromStr for CanonicalCommand {
-    type Err = String;
+/// The detection key: a canonical command plus at most one modifier.
+///
+/// Ordering is canonical declaration order, then plain before variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CommandKey {
+    pub canonical: CanonicalCommand,
+    pub modifier: Option<Modifier>,
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "install" => Ok(Self::Install),
-            "test" => Ok(Self::Test),
-            "e2e" => Ok(Self::E2e),
-            "lint" => Ok(Self::Lint),
-            "typecheck" => Ok(Self::Typecheck),
-            "fix" => Ok(Self::Fix),
-            "format" => Ok(Self::Format),
-            "build" => Ok(Self::Build),
-            "clean" => Ok(Self::Clean),
-            _ => Err(format!(
-                "Unknown command: {s}. Valid commands: {}",
-                Self::all_names()
-            )),
+impl CommandKey {
+    /// Every (canonical, modifier) pair letme understands: what detectors can
+    /// resolve, and what the CLI offers as a flag on the canonical's name.
+    pub const VARIANTS: &'static [CommandKey] = &[
+        CanonicalCommand::Lint.with(Modifier::Fix),
+        CanonicalCommand::Format.with(Modifier::Check),
+    ];
+
+    /// Every valid detection key: each canonical's plain key, then the
+    /// variants. Feeds the info view.
+    pub fn all() -> Vec<CommandKey> {
+        CanonicalCommand::all()
+            .iter()
+            .copied()
+            .map(CommandKey::from)
+            .chain(Self::VARIANTS.iter().copied())
+            .collect()
+    }
+
+    /// The variants of one canonical, in [`VARIANTS`](Self::VARIANTS) order.
+    pub fn variants_of(canonical: CanonicalCommand) -> impl Iterator<Item = CommandKey> {
+        Self::VARIANTS
+            .iter()
+            .copied()
+            .filter(move |k| k.canonical == canonical)
+    }
+}
+
+impl From<CanonicalCommand> for CommandKey {
+    fn from(canonical: CanonicalCommand) -> Self {
+        Self {
+            canonical,
+            modifier: None,
         }
+    }
+}
+
+impl CanonicalCommand {
+    /// This canonical with a modifier attached, e.g. `Format.with(Check)` for
+    /// `format --check`.
+    pub const fn with(self, modifier: Modifier) -> CommandKey {
+        CommandKey {
+            canonical: self,
+            modifier: Some(modifier),
+        }
+    }
+}
+
+impl fmt::Display for CommandKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.canonical)?;
+        if let Some(m) = self.modifier {
+            write!(f, " {}", m.flag())?;
+        }
+        Ok(())
     }
 }
 
@@ -122,14 +189,19 @@ impl fmt::Display for Ecosystem {
 /// A resolved command ready for execution.
 #[derive(Debug, Clone)]
 pub struct ResolvedCommand {
-    pub canonical: CanonicalCommand,
+    pub key: CommandKey,
     pub cmd: String,
     pub label: String,
     pub tier: Tier,
     pub ecosystem: Ecosystem,
     pub detector_name: String,
     pub priority: u32,
+    /// Covered by the plain key of this canonical, same detector (`cargo check`
+    /// covered by `lint`, not by `lint --fix`).
     pub covered_by: Option<CanonicalCommand>,
+    /// Provenance for a command that isn't simply "what the detector found",
+    /// e.g. a synthesized variant. Shown by the verbose `resolved →` trace.
+    pub note: Option<String>,
 }
 
 /// Trait implemented by all detectors.
@@ -151,14 +223,19 @@ pub trait Detector {
     }
 
     /// Helper to build a ResolvedCommand with common fields filled in.
+    ///
+    /// `Self: Sized` keeps this generic method out of the vtable.
     fn make_command(
         &self,
-        canonical: CanonicalCommand,
+        key: impl Into<CommandKey>,
         cmd: String,
         priority: u32,
-    ) -> ResolvedCommand {
+    ) -> ResolvedCommand
+    where
+        Self: Sized,
+    {
         ResolvedCommand {
-            canonical,
+            key: key.into(),
             label: cmd.clone(),
             cmd,
             tier: self.tier(),
@@ -166,6 +243,7 @@ pub trait Detector {
             detector_name: self.name().into(),
             priority,
             covered_by: None,
+            note: None,
         }
     }
 
@@ -173,14 +251,17 @@ pub trait Detector {
     /// covers, like `cargo check` under `cargo clippy`.
     fn make_covered_command(
         &self,
-        canonical: CanonicalCommand,
+        key: impl Into<CommandKey>,
         cmd: String,
         priority: u32,
         covered_by: CanonicalCommand,
-    ) -> ResolvedCommand {
+    ) -> ResolvedCommand
+    where
+        Self: Sized,
+    {
         ResolvedCommand {
             covered_by: Some(covered_by),
-            ..self.make_command(canonical, cmd, priority)
+            ..self.make_command(key, cmd, priority)
         }
     }
 }
@@ -248,6 +329,14 @@ pub fn check_missing_binaries(groups: &[DetectorGroup], dir: &Path) -> Vec<Missi
     missing
 }
 
+/// Render a `ResolvedCommand`'s note as a verbose-trace suffix, e.g.
+/// `" (synthesized from 'format' script)"`. The note contains repo-controlled
+/// text, so it is sanitized.
+fn verbose_note_suffix(note: Option<&str>) -> String {
+    note.map(|n| format!(" ({})", sanitize(n)))
+        .unwrap_or_default()
+}
+
 /// Run all detectors against a directory and resolve commands using tier logic.
 ///
 /// Detectors are organized in **exclusive groups**: within each group, the first
@@ -260,7 +349,7 @@ pub fn check_missing_binaries(groups: &[DetectorGroup], dir: &Path) -> Vec<Missi
 pub fn resolve_all(
     detector_groups: &[DetectorGroup],
     dir: &Path,
-    commands: &[CanonicalCommand],
+    commands: &[CommandKey],
     verbose: bool,
 ) -> Vec<ResolvedCommand> {
     // Collect all resolved commands from all detectors that detect
@@ -319,19 +408,62 @@ pub fn resolve_all(
         }
     }
 
+    // Variants never resolve below the best tier of their plain key. With no
+    // plain entry anywhere for this canonical, the variant is unrestricted.
+    let plain_tier = |canonical: CanonicalCommand| -> Option<Tier> {
+        all.iter()
+            .filter(|r| r.key.canonical == canonical && r.key.modifier.is_none())
+            .map(|r| r.tier)
+            .min()
+    };
+
     let mut result = Vec::new();
 
-    for &cmd in commands {
-        let matches: Vec<&ResolvedCommand> = all.iter().filter(|r| r.canonical == cmd).collect();
+    for &key in commands {
+        let matches: Vec<&ResolvedCommand> = all.iter().filter(|r| r.key == key).collect();
         if matches.is_empty() {
             continue;
         }
 
-        // Find the best (lowest) tier among matches
-        let best_tier = matches.iter().map(|r| r.tier).min().unwrap();
+        let best_tier = if key.modifier.is_none() {
+            matches.iter().map(|r| r.tier).min()
+        } else {
+            match plain_tier(key.canonical) {
+                Some(base) => {
+                    let restricted = matches
+                        .iter()
+                        .filter(|r| r.tier <= base)
+                        .map(|r| r.tier)
+                        .min();
+                    if restricted.is_none() && verbose {
+                        let owner = all.iter().find(|r| {
+                            r.key.canonical == key.canonical
+                                && r.key.modifier.is_none()
+                                && r.tier == base
+                        });
+                        if let Some(owner) = owner {
+                            let word = key
+                                .modifier
+                                .map(|m| m.flag().trim_start_matches("--"))
+                                .unwrap_or_default();
+                            eprintln!(
+                                "[verbose] {key}: only detected below {}'s tier ({base}, {}); not detected. Declare a {}-{word} recipe/task or {}:{word} script at that tier",
+                                key.canonical, owner.detector_name, key.canonical, key.canonical
+                            );
+                        }
+                    }
+                    restricted
+                }
+                None => matches.iter().map(|r| r.tier).min(),
+            }
+        };
+
+        let Some(best_tier) = best_tier else {
+            continue;
+        };
 
         if verbose && matches.iter().any(|r| r.tier != best_tier) {
-            eprintln!("[verbose] {cmd}: tier {best_tier} overrides lower-priority tiers");
+            eprintln!("[verbose] {key}: tier {best_tier} overrides lower-priority tiers");
         }
 
         // If tier 2 matches, use only tier 2 (cross-ecosystem override)
@@ -349,7 +481,7 @@ pub fn resolve_all(
                 Some(existing) if existing.priority >= r.priority => {
                     if verbose {
                         eprintln!(
-                            "[verbose] {cmd}: '{}' (priority {}) beaten by '{}' (priority {}) in {}",
+                            "[verbose] {key}: '{}' (priority {}) beaten by '{}' (priority {}) in {}",
                             sanitize(&r.cmd),
                             r.priority,
                             sanitize(&existing.cmd),
@@ -361,7 +493,7 @@ pub fn resolve_all(
                 _ => {
                     if verbose && let Some(old) = seen_ecosystems.get(&r.ecosystem) {
                         eprintln!(
-                            "[verbose] {cmd}: '{}' (priority {}) replaces '{}' (priority {}) in {}",
+                            "[verbose] {key}: '{}' (priority {}) replaces '{}' (priority {}) in {}",
                             sanitize(&r.cmd),
                             r.priority,
                             sanitize(&old.cmd),
@@ -381,8 +513,9 @@ pub fn resolve_all(
 
         if verbose {
             for r in &cmd_results {
+                let note = verbose_note_suffix(r.note.as_deref());
                 eprintln!(
-                    "[verbose] {cmd}: resolved → '{}' [{}]",
+                    "[verbose] {key}: resolved → '{}' [{}]{note}",
                     sanitize(&r.cmd),
                     r.detector_name
                 );
@@ -415,79 +548,115 @@ impl ScriptMatchKind {
 /// What content inspection concluded about a command string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inference {
-    /// Recognized as a specific canonical command.
-    Canonical(CanonicalCommand),
+    /// Recognized as a specific detection key.
+    Canonical(CommandKey),
     /// Recognized as a check-only formatter run (`prettier --check`,
     /// `php-cs-fixer --dry-run`, `pint --test`, `biome format` without a write
-    /// flag). It has no canonical slot: it does not mutate, so it is not a
-    /// Format; it is not a Lint either.
+    /// flag). Unlike `Canonical`, a check-shaped name (`lint`, `check`,
+    /// `format:check`) wins over it; see [`combine`].
     FormatVerify,
     /// Not recognized.
     Unknown,
 }
 
 impl Inference {
-    /// The canonical command, if one was recognized. Format-verifies and
-    /// unrecognized commands both yield `None`.
-    pub fn canonical(self) -> Option<CanonicalCommand> {
+    /// The key, if one was recognized outright. A format-verify yields `None`
+    /// here: its key depends on the name it is combined with.
+    pub fn key(self) -> Option<CommandKey> {
         match self {
-            Self::Canonical(cmd) => Some(cmd),
+            Self::Canonical(key) => Some(key),
             Self::FormatVerify | Self::Unknown => None,
         }
     }
 }
 
-/// Map a name to a canonical command using exact matching only.
+/// Launchers that resolve a tool themselves; the tool is the token after one
+/// of these, not the token itself.
+pub const INTERPRETERS: &[&str] = &["php", "node", "npx", "bunx"];
+
+/// Index of the tool token in `tokens`, skipping one interpreter prefix.
+/// `None` when there is no token left to name a tool.
+pub fn tool_index(tokens: &[&str]) -> Option<usize> {
+    let start = usize::from(INTERPRETERS.contains(&basename(tokens.first()?)));
+    (start < tokens.len()).then_some(start)
+}
+
+/// Map a name to a detection key using exact matching only.
 ///
 /// Covers all standard aliases: "test", "lint", "check", "format", "fmt", etc.
-pub fn map_canonical_name(name: &str) -> Option<CanonicalCommand> {
+pub fn map_canonical_name(name: &str) -> Option<CommandKey> {
     match name {
-        "test" => Some(CanonicalCommand::Test),
-        "e2e" | "test:e2e" => Some(CanonicalCommand::E2e),
-        "fix" | "lint:fix" | "lint-fix" => Some(CanonicalCommand::Fix),
-        "lint" | "check" | "analyse" | "analyze" => Some(CanonicalCommand::Lint),
-        "typecheck" | "type-check" => Some(CanonicalCommand::Typecheck),
-        "format" | "fmt" => Some(CanonicalCommand::Format),
-        "build" => Some(CanonicalCommand::Build),
-        "install" => Some(CanonicalCommand::Install),
-        "clean" => Some(CanonicalCommand::Clean),
+        "test" => Some(CanonicalCommand::Test.into()),
+        "e2e" | "test:e2e" => Some(CanonicalCommand::E2e.into()),
+        "fix" | "lint:fix" | "lint-fix" => Some(CanonicalCommand::Lint.with(Modifier::Fix)),
+        "lint" | "check" | "analyse" | "analyze" => Some(CanonicalCommand::Lint.into()),
+        "typecheck" | "type-check" => Some(CanonicalCommand::Typecheck.into()),
+        "format" | "fmt" => Some(CanonicalCommand::Format.into()),
+        "format:check" | "format-check" | "fmt:check" | "fmt-check" => {
+            Some(CanonicalCommand::Format.with(Modifier::Check))
+        }
+        "build" => Some(CanonicalCommand::Build.into()),
+        "install" => Some(CanonicalCommand::Install.into()),
+        "clean" => Some(CanonicalCommand::Clean.into()),
         _ => None,
     }
 }
 
-/// Map a script name to a canonical command using exact + prefix matching.
+/// Map a script name to a detection key using exact + prefix matching.
 ///
 /// Matches: "test" and "test:unit" map to Test; "e2e", "test:e2e" and
 /// "test:e2e:*" map to E2e (e2e suites must not hide behind `letme test`).
 /// Does NOT match: "contest", "testing".
 /// Returns the match kind so callers can assign different priorities.
-pub fn map_script_name(name: &str) -> Option<(CanonicalCommand, ScriptMatchKind)> {
-    if let Some(cmd) = map_canonical_name(name) {
-        return Some((cmd, ScriptMatchKind::Exact));
+pub fn map_script_name(name: &str) -> Option<(CommandKey, ScriptMatchKind)> {
+    if let Some(key) = map_canonical_name(name) {
+        return Some((key, ScriptMatchKind::Exact));
     }
 
     // Prefix matches (name starts with "test:", "lint:", etc.)
     // "test:e2e:" must be claimed before the generic "test:" arm.
     if name.starts_with("test:e2e:") || name.starts_with("e2e:") {
-        return Some((CanonicalCommand::E2e, ScriptMatchKind::Prefix));
+        return Some((CanonicalCommand::E2e.into(), ScriptMatchKind::Prefix));
     }
     if name.starts_with("test:") {
-        return Some((CanonicalCommand::Test, ScriptMatchKind::Prefix));
+        return Some((CanonicalCommand::Test.into(), ScriptMatchKind::Prefix));
     }
     if name.starts_with("fix:") {
-        return Some((CanonicalCommand::Fix, ScriptMatchKind::Prefix));
+        return Some((
+            CanonicalCommand::Lint.with(Modifier::Fix),
+            ScriptMatchKind::Prefix,
+        ));
+    }
+    // "lint:fix:"/"lint-fix:" must be claimed before the generic "lint:" arm.
+    if name.starts_with("lint:fix:") || name.starts_with("lint-fix:") {
+        return Some((
+            CanonicalCommand::Lint.with(Modifier::Fix),
+            ScriptMatchKind::Prefix,
+        ));
     }
     if name.starts_with("lint:") {
-        return Some((CanonicalCommand::Lint, ScriptMatchKind::Prefix));
+        return Some((CanonicalCommand::Lint.into(), ScriptMatchKind::Prefix));
     }
     if name.starts_with("typecheck:") || name.starts_with("type-check:") {
-        return Some((CanonicalCommand::Typecheck, ScriptMatchKind::Prefix));
+        return Some((CanonicalCommand::Typecheck.into(), ScriptMatchKind::Prefix));
+    }
+    // "format:check:"/"fmt:check:"/"format-check:"/"fmt-check:" must be
+    // claimed before the generic "format:"/"fmt:" arm.
+    if name.starts_with("format:check:")
+        || name.starts_with("fmt:check:")
+        || name.starts_with("format-check:")
+        || name.starts_with("fmt-check:")
+    {
+        return Some((
+            CanonicalCommand::Format.with(Modifier::Check),
+            ScriptMatchKind::Prefix,
+        ));
     }
     if name.starts_with("format:") || name.starts_with("fmt:") {
-        return Some((CanonicalCommand::Format, ScriptMatchKind::Prefix));
+        return Some((CanonicalCommand::Format.into(), ScriptMatchKind::Prefix));
     }
     if name.starts_with("build:") {
-        return Some((CanonicalCommand::Build, ScriptMatchKind::Prefix));
+        return Some((CanonicalCommand::Build.into(), ScriptMatchKind::Prefix));
     }
 
     None
@@ -504,7 +673,7 @@ pub fn map_script_name(name: &str) -> Option<(CanonicalCommand, ScriptMatchKind)
 pub fn infer_from_command(cmd: &str) -> Inference {
     let subcommands = split_compound_command(cmd);
 
-    let mut result: Option<CanonicalCommand> = None;
+    let mut result: Option<CommandKey> = None;
     let mut saw_format_verify = false;
 
     for sub in &subcommands {
@@ -532,21 +701,9 @@ pub fn infer_from_command(cmd: &str) -> Inference {
 /// and skips interpreter prefixes (`php`, `node`, `npx`, `bunx`).
 fn infer_single_command(cmd: &str) -> Inference {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.is_empty() {
+    let Some(start) = tool_index(&parts) else {
         return Inference::Unknown;
-    }
-
-    // Skip interpreter prefixes to get the actual tool
-    let interpreters = ["php", "node", "npx", "bunx"];
-    let start = if interpreters.contains(&basename(parts[0])) {
-        1
-    } else {
-        0
     };
-
-    if start >= parts.len() {
-        return Inference::Unknown;
-    }
 
     let tool = basename(parts[start]);
     // Check for biome/playwright/cypress subcommands
@@ -557,60 +714,56 @@ fn infer_single_command(cmd: &str) -> Inference {
     match tool {
         // Test
         "phpunit" | "pest" | "jest" | "vitest" | "mocha" => {
-            Inference::Canonical(CanonicalCommand::Test)
+            Inference::Canonical(CanonicalCommand::Test.into())
         }
         // E2e: only an actual suite run counts; `playwright install`/`codegen`
         // and the interactive `cypress open` stay unclassified
         "playwright" => match subcommand {
-            Some("test") => Inference::Canonical(CanonicalCommand::E2e),
+            Some("test") => Inference::Canonical(CanonicalCommand::E2e.into()),
             _ => Inference::Unknown,
         },
         "cypress" => match subcommand {
-            Some("run") => Inference::Canonical(CanonicalCommand::E2e),
+            Some("run") => Inference::Canonical(CanonicalCommand::E2e.into()),
             _ => Inference::Unknown,
         },
         // Lint / Fix
-        "phpstan" | "psalm" | "phpcs" => Inference::Canonical(CanonicalCommand::Lint),
+        "phpstan" | "psalm" | "phpcs" => Inference::Canonical(CanonicalCommand::Lint.into()),
         "eslint" | "oxlint" => {
             if args.contains(&"--fix") {
-                Inference::Canonical(CanonicalCommand::Fix)
+                Inference::Canonical(CanonicalCommand::Lint.with(Modifier::Fix))
             } else {
-                Inference::Canonical(CanonicalCommand::Lint)
+                Inference::Canonical(CanonicalCommand::Lint.into())
             }
         }
         // Format (with dry-run detection for check-only mode)
         "php-cs-fixer" => {
             if args.contains(&"--dry-run") {
-                // Format-verify (dry-run) has no canonical slot: it doesn't
-                // mutate, so it is neither a Format nor a Lint.
                 Inference::FormatVerify
             } else {
-                Inference::Canonical(CanonicalCommand::Format)
+                Inference::Canonical(CanonicalCommand::Format.into())
             }
         }
         "pint" => {
             if args.contains(&"--test") {
-                // Format-verify (--test), not a lint.
                 Inference::FormatVerify
             } else {
-                Inference::Canonical(CanonicalCommand::Format)
+                Inference::Canonical(CanonicalCommand::Format.into())
             }
         }
         "prettier" => {
             if args.contains(&"--check") {
-                // Format-verify (--check), not a lint.
                 Inference::FormatVerify
             } else {
-                Inference::Canonical(CanonicalCommand::Format)
+                Inference::Canonical(CanonicalCommand::Format.into())
             }
         }
-        "phpcbf" => Inference::Canonical(CanonicalCommand::Format),
+        "phpcbf" => Inference::Canonical(CanonicalCommand::Format.into()),
         // Build / Typecheck: bare tsc emits JS, --noEmit only checks types
         "tsc" => {
             if args.contains(&"--noEmit") {
-                Inference::Canonical(CanonicalCommand::Typecheck)
+                Inference::Canonical(CanonicalCommand::Typecheck.into())
             } else {
-                Inference::Canonical(CanonicalCommand::Build)
+                Inference::Canonical(CanonicalCommand::Build.into())
             }
         }
         // Biome needs subcommand inspection
@@ -621,9 +774,9 @@ fn infer_single_command(cmd: &str) -> Inference {
                     .iter()
                     .any(|a| *a == "--fix" || *a == "--apply" || *a == "--write")
                 {
-                    Inference::Canonical(CanonicalCommand::Fix)
+                    Inference::Canonical(CanonicalCommand::Lint.with(Modifier::Fix))
                 } else {
-                    Inference::Canonical(CanonicalCommand::Lint)
+                    Inference::Canonical(CanonicalCommand::Lint.into())
                 }
             }
             Some("format") => {
@@ -632,7 +785,7 @@ fn infer_single_command(cmd: &str) -> Inference {
                 // alias. `--apply` (accepted by check/lint) was never valid
                 // for `format`. Bare `biome format` only reports.
                 if biome_args.iter().any(|a| *a == "--write" || *a == "--fix") {
-                    Inference::Canonical(CanonicalCommand::Format)
+                    Inference::Canonical(CanonicalCommand::Format.into())
                 } else {
                     Inference::FormatVerify
                 }
@@ -646,7 +799,50 @@ fn infer_single_command(cmd: &str) -> Inference {
 /// Split a command string on `&&`, `||`, and `;` operators, respecting quoted strings.
 /// Pipes (`|`) are left alone: a pipeline is one logical command.
 fn split_compound_command(cmd: &str) -> Vec<&str> {
+    split_compound_command_with_ops(cmd).0
+}
+
+/// One operator joining two parts of a compound command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOp {
+    And,
+    Or,
+    Semicolon,
+}
+
+impl CompoundOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::And => "&&",
+            Self::Or => "||",
+            Self::Semicolon => ";",
+        }
+    }
+}
+
+/// Like [`split_compound_command`], but also returns the operator between
+/// each pair of segments, so the whole can be rejoined faithfully
+/// (`ops.len() == parts.len() - 1` for any non-empty result).
+fn split_compound_command_with_ops(cmd: &str) -> (Vec<&str>, Vec<CompoundOp>) {
+    fn push_segment<'a>(
+        cmd: &'a str,
+        start: usize,
+        end: usize,
+        op: Option<CompoundOp>,
+        parts: &mut Vec<&'a str>,
+        ops: &mut Vec<CompoundOp>,
+    ) {
+        let segment = cmd[start..end].trim();
+        if !segment.is_empty() {
+            parts.push(segment);
+            if let Some(op) = op {
+                ops.push(op);
+            }
+        }
+    }
+
     let mut parts = Vec::new();
+    let mut ops = Vec::new();
     let mut start = 0;
     let bytes = cmd.as_bytes();
     let len = bytes.len();
@@ -666,26 +862,24 @@ fn split_compound_command(cmd: &str) -> Vec<&str> {
                 i += 1;
             }
             b'&' if !in_single_quote && !in_double_quote && i + 1 < len && bytes[i + 1] == b'&' => {
-                let segment = cmd[start..i].trim();
-                if !segment.is_empty() {
-                    parts.push(segment);
-                }
+                push_segment(cmd, start, i, Some(CompoundOp::And), &mut parts, &mut ops);
                 i += 2;
                 start = i;
             }
             b'|' if !in_single_quote && !in_double_quote && i + 1 < len && bytes[i + 1] == b'|' => {
-                let segment = cmd[start..i].trim();
-                if !segment.is_empty() {
-                    parts.push(segment);
-                }
+                push_segment(cmd, start, i, Some(CompoundOp::Or), &mut parts, &mut ops);
                 i += 2;
                 start = i;
             }
             b';' if !in_single_quote && !in_double_quote => {
-                let segment = cmd[start..i].trim();
-                if !segment.is_empty() {
-                    parts.push(segment);
-                }
+                push_segment(
+                    cmd,
+                    start,
+                    i,
+                    Some(CompoundOp::Semicolon),
+                    &mut parts,
+                    &mut ops,
+                );
                 i += 1;
                 start = i;
             }
@@ -695,53 +889,230 @@ fn split_compound_command(cmd: &str) -> Vec<&str> {
         }
     }
 
-    let segment = cmd[start..].trim();
-    if !segment.is_empty() {
-        parts.push(segment);
-    }
+    push_segment(cmd, start, len, None, &mut parts, &mut ops);
 
-    parts
+    // A trailing separator (`"prettier -w .;"`) pushes an operator whose
+    // right-hand segment turned out empty and was dropped; without this, the
+    // invariant below would be off by one.
+    ops.truncate(parts.len().saturating_sub(1));
+
+    (parts, ops)
 }
 
 /// Extract the basename (filename) from a potentially path-like string.
-fn basename(s: &str) -> &str {
+pub fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
 
-/// Map a script by combining name matching with content inspection.
-///
-/// Returns `Option<(CanonicalCommand, priority)>`:
-/// - Name claims Format/Fix but content is a check-only format run: None
-/// - Name and content agree (or content unclassified): name's canonical, exact=10/prefix=5
-/// - Name and content disagree: content's canonical, priority 3
-/// - No name match, content matches: content's canonical, priority 7
-/// - Neither matches: None
-pub fn map_script(name: &str, command: &str) -> Option<(CanonicalCommand, u32)> {
-    let name_match = map_script_name(name);
-    let content_match = infer_from_command(command);
+/// Whether a key claims to write (mutate) files: plain `format`, or `lint
+/// --fix`.
+fn is_write_claiming(key: CommandKey) -> bool {
+    key == CommandKey::from(CanonicalCommand::Format)
+        || key == CanonicalCommand::Lint.with(Modifier::Fix)
+}
 
+/// Combine a name match with content inspection into a key and priority.
+/// When they agree the name's priority applies (exact 10, prefix 5); content
+/// wins a disagreement at 3 and resolves on its own at 7.
+pub fn combine(
+    name_match: Option<(CommandKey, ScriptMatchKind)>,
+    content_match: Inference,
+) -> Option<(CommandKey, u32)> {
     match (name_match, content_match) {
-        // Content is a check-only format run and the name claims a *mutating*
-        // canonical. The script cannot deliver it, so leave the slot empty and
-        // let a lower tier supply a real formatter. A check-shaped name
-        // (`lint`, `check`) is still trusted by the arm below.
-        (Some((CanonicalCommand::Format | CanonicalCommand::Fix, _)), Inference::FormatVerify) => {
-            None
+        // A check-only format run cannot satisfy a name that claims to write,
+        // so it rehomes to the check variant. A check-shaped name (`lint`,
+        // `check`, `format:check`) is trusted by the arm below.
+        (Some((key, _)), Inference::FormatVerify) if is_write_claiming(key) => {
+            Some((CanonicalCommand::Format.with(Modifier::Check), 3))
         }
         // Name matches, content unclassified: trust the name
-        (Some((name_cmd, kind)), Inference::FormatVerify | Inference::Unknown) => {
-            Some((name_cmd, kind.priority()))
+        (Some((name_key, kind)), Inference::FormatVerify | Inference::Unknown) => {
+            Some((name_key, kind.priority()))
         }
         // Name and content agree: trust the name
-        (Some((name_cmd, kind)), Inference::Canonical(content_cmd)) if name_cmd == content_cmd => {
-            Some((name_cmd, kind.priority()))
+        (Some((name_key, kind)), Inference::Canonical(content_key)) if name_key == content_key => {
+            Some((name_key, kind.priority()))
         }
         // Name and content disagree: trust the content
-        (Some(_), Inference::Canonical(content_cmd)) => Some((content_cmd, 3)),
-        // No name match, content matches
-        (None, Inference::Canonical(content_cmd)) => Some((content_cmd, 7)),
+        (Some(_), Inference::Canonical(content_key)) => Some((content_key, 3)),
+        // No name match, content matches a canonical
+        (None, Inference::Canonical(content_key)) => Some((content_key, 7)),
+        // No name match, content is a check-only format run: still real signal
+        (None, Inference::FormatVerify) => {
+            Some((CanonicalCommand::Format.with(Modifier::Check), 7))
+        }
         // Neither matches
-        (None, Inference::FormatVerify | Inference::Unknown) => None,
+        (None, Inference::Unknown) => None,
+    }
+}
+
+/// Map a script by combining name matching with content inspection.
+pub fn map_script(name: &str, command: &str) -> Option<(CommandKey, u32)> {
+    combine(map_script_name(name), infer_from_command(command))
+}
+
+/// A tier-3 variant synthesized from a plain script's body by rewriting the
+/// tool invocation itself, rather than relying on an explicit variant script.
+pub struct SynthesizedVariant {
+    pub key: CommandKey,
+    parts: Vec<String>,
+    ops: Vec<CompoundOp>,
+}
+
+impl SynthesizedVariant {
+    /// The synthesized parts, in order.
+    pub fn parts(&self) -> &[String] {
+        &self.parts
+    }
+
+    /// Join the parts with their original operators, passing each part
+    /// through `f` first (e.g. to prefix it with a package manager's exec
+    /// command).
+    pub fn render(&self, mut f: impl FnMut(&str) -> String) -> String {
+        let mut out = String::new();
+        for (i, part) in self.parts.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+                out.push_str(self.ops[i - 1].as_str());
+                out.push(' ');
+            }
+            out.push_str(&f(part));
+        }
+        out
+    }
+}
+
+/// Synthesize `target` from a plain script's body by rewriting the tool
+/// invocation itself, e.g. `format: "prettier -w src"` synthesizes
+/// `format --check` running `prettier --check src`.
+///
+/// Every compound part must be eligible (see [`eligible_part`]) and at least
+/// one part must actually be transformed, or the whole body is declined.
+pub fn synthesize_variant(target: CommandKey, body: &str) -> Option<SynthesizedVariant> {
+    let (segments, ops) = split_compound_command_with_ops(body);
+
+    let mut parts = Vec::with_capacity(segments.len());
+    let mut any_transformed = false;
+
+    for segment in &segments {
+        match eligible_part(target, segment)? {
+            PartOutcome::Transformed(rendered) => {
+                any_transformed = true;
+                parts.push(rendered);
+            }
+            PartOutcome::PassThrough => parts.push((*segment).to_string()),
+        }
+    }
+
+    if !any_transformed {
+        return None;
+    }
+
+    Some(SynthesizedVariant {
+        key: target,
+        parts,
+        ops,
+    })
+}
+
+enum PartOutcome {
+    Transformed(String),
+    PassThrough,
+}
+
+/// How one compound part takes part in synthesizing `target`: rewritten if it
+/// is the plain form of `target`'s canonical and has a known rewrite, passed
+/// through if it doesn't write files. `None` declines the whole body.
+fn eligible_part(target: CommandKey, segment: &str) -> Option<PartOutcome> {
+    let inference = infer_single_command(segment);
+
+    if inference == Inference::Canonical(target) {
+        return None;
+    }
+
+    if inference == Inference::Canonical(CommandKey::from(target.canonical))
+        && let Some(rendered) = transform(target, segment)
+    {
+        return Some(PartOutcome::Transformed(rendered));
+    }
+
+    let passes_through = inference == Inference::FormatVerify
+        || inference == Inference::Canonical(CanonicalCommand::Lint.into())
+        || inference == Inference::Canonical(CanonicalCommand::Typecheck.into());
+
+    if passes_through {
+        return Some(PartOutcome::PassThrough);
+    }
+
+    None
+}
+
+/// Token-level rewrite of one plain-content part into `target`, for the tools
+/// with a known transformation. Preserves the part's own paths/flags;
+/// inserted flags land right after the tool token (and its subcommand, where
+/// one is required), so shapes match the tier-4 emissions.
+fn transform(target: CommandKey, segment: &str) -> Option<String> {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let start = tool_index(&tokens)?;
+    let tool = basename(tokens[start]);
+
+    if target == CanonicalCommand::Format.with(Modifier::Check) {
+        match tool {
+            "prettier" => {
+                let mut out: Vec<String> = tokens
+                    .iter()
+                    .filter(|t| **t != "--write" && **t != "-w")
+                    .map(|t| (*t).to_string())
+                    .collect();
+                out.insert((start + 1).min(out.len()), "--check".to_string());
+                Some(out.join(" "))
+            }
+            "biome" => {
+                let out: Vec<String> = tokens
+                    .iter()
+                    .filter(|t| **t != "--write" && **t != "--fix")
+                    .map(|t| (*t).to_string())
+                    .collect();
+                Some(out.join(" "))
+            }
+            "php-cs-fixer" => {
+                // Search from after the tool token so a `fix` argument
+                // (rather than the subcommand) can't be mistaken for it.
+                let fix_pos = start + 1 + tokens[start + 1..].iter().position(|t| *t == "fix")?;
+                let mut out: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+                out.splice(
+                    fix_pos + 1..fix_pos + 1,
+                    ["--dry-run".to_string(), "--diff".to_string()],
+                );
+                Some(out.join(" "))
+            }
+            "pint" => {
+                let mut out: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+                out.push("--test".to_string());
+                Some(out.join(" "))
+            }
+            _ => None,
+        }
+    } else if target == CanonicalCommand::Lint.with(Modifier::Fix) {
+        match tool {
+            // eslint/oxlint take a bare `--fix`; biome's fix flag lands right
+            // after its subcommand (`check`/`lint`, guaranteed present here
+            // since that's the only shape content inference classifies as
+            // plain Lint).
+            "eslint" | "oxlint" => {
+                let mut out: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+                out.insert((start + 1).min(out.len()), "--fix".to_string());
+                Some(out.join(" "))
+            }
+            "biome" => {
+                let mut out: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+                out.insert((start + 2).min(out.len()), "--fix".to_string());
+                Some(out.join(" "))
+            }
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 
@@ -753,7 +1124,7 @@ mod tests {
         name: &'static str,
         tier: Tier,
         ecosystem: Ecosystem,
-        commands: Vec<(CanonicalCommand, String, u32)>,
+        commands: Vec<(CommandKey, String, u32)>,
         binaries: &'static [&'static str],
     }
 
@@ -773,9 +1144,7 @@ mod tests {
         fn resolve_commands(&self, _dir: &Path) -> Vec<ResolvedCommand> {
             self.commands
                 .iter()
-                .map(|(canonical, cmd, priority)| {
-                    self.make_command(*canonical, cmd.clone(), *priority)
-                })
+                .map(|(key, cmd, priority)| self.make_command(*key, cmd.clone(), *priority))
                 .collect()
         }
         fn required_binaries(&self) -> &[&str] {
@@ -788,6 +1157,25 @@ mod tests {
         tier: Tier,
         ecosystem: Ecosystem,
         commands: Vec<(CanonicalCommand, String, u32)>,
+    ) -> Box<dyn Detector> {
+        mock_keyed(
+            name,
+            tier,
+            ecosystem,
+            commands
+                .into_iter()
+                .map(|(c, cmd, p)| (c.into(), cmd, p))
+                .collect(),
+        )
+    }
+
+    /// Like [`mock`], but for commands keyed by a full (possibly variant)
+    /// `CommandKey`.
+    fn mock_keyed(
+        name: &'static str,
+        tier: Tier,
+        ecosystem: Ecosystem,
+        commands: Vec<(CommandKey, String, u32)>,
     ) -> Box<dyn Detector> {
         Box::new(MockDetector {
             name,
@@ -809,7 +1197,10 @@ mod tests {
             name,
             tier,
             ecosystem,
-            commands,
+            commands: commands
+                .into_iter()
+                .map(|(c, cmd, p)| (c.into(), cmd, p))
+                .collect(),
             binaries,
         })
     }
@@ -843,7 +1234,7 @@ mod tests {
         ];
 
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "just test");
@@ -867,7 +1258,7 @@ mod tests {
         ];
 
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "vendor/bin/pest");
@@ -891,12 +1282,26 @@ mod tests {
         ];
 
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert_eq!(result.len(), 2);
         // Results sorted by ecosystem (JavaScript < Php < Rust < TaskRunner)
         assert_eq!(result[0].cmd, "vendor/bin/phpunit");
         assert_eq!(result[1].cmd, "cargo test");
+    }
+
+    #[test]
+    fn verbose_note_suffix_sanitizes_hostile_text() {
+        // A note is built from repo-controlled text (a script name); a
+        // hostile one must not smuggle terminal escapes onto stderr.
+        let note = verbose_note_suffix(Some("synthesized from 'fmtx\x1b[31mEVIL\x1b[0m' script"));
+        assert!(!note.contains('\u{1b}'), "got: {note}");
+        assert!(note.contains('\u{FFFD}'), "got: {note}");
+    }
+
+    #[test]
+    fn verbose_note_suffix_is_empty_for_none() {
+        assert_eq!(verbose_note_suffix(None), "");
     }
 
     #[test]
@@ -909,9 +1314,100 @@ mod tests {
         ))];
 
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn variant_below_the_plain_keys_tier_is_suppressed() {
+        // Justfile owns plain `format` at tier 2, so a tier-4 convention's
+        // `format --check` must not fill the variant.
+        let groups = vec![
+            group(mock(
+                "justfile",
+                Tier::Tier2,
+                Ecosystem::TaskRunner,
+                vec![(CanonicalCommand::Format, "just format".into(), 10)],
+            )),
+            group(mock_keyed(
+                "cargo",
+                Tier::Tier4,
+                Ecosystem::Rust,
+                vec![(
+                    CanonicalCommand::Format.with(Modifier::Check),
+                    "cargo fmt --check".into(),
+                    10,
+                )],
+            )),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_all(
+            &groups,
+            dir.path(),
+            &[CanonicalCommand::Format.with(Modifier::Check)],
+            false,
+        );
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn variant_at_or_above_the_plain_keys_tier_competes_normally() {
+        // Both plain `format` and `format --check` come from the same tier;
+        // the variant resolves normally, uninhibited by the base-tier rule.
+        let groups = vec![group(mock_keyed(
+            "cargo",
+            Tier::Tier4,
+            Ecosystem::Rust,
+            vec![
+                (CanonicalCommand::Format.into(), "cargo fmt".into(), 10),
+                (
+                    CanonicalCommand::Format.with(Modifier::Check),
+                    "cargo fmt --check".into(),
+                    10,
+                ),
+            ],
+        ))];
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_all(
+            &groups,
+            dir.path(),
+            &[CanonicalCommand::Format.with(Modifier::Check)],
+            false,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].cmd, "cargo fmt --check");
+    }
+
+    #[test]
+    fn variant_with_no_plain_entry_anywhere_resolves_unrestricted() {
+        // A variant-only project (no plain `format` detected at all) is not
+        // restricted by a base tier that doesn't exist.
+        let groups = vec![group(mock_keyed(
+            "cargo",
+            Tier::Tier4,
+            Ecosystem::Rust,
+            vec![(
+                CanonicalCommand::Format.with(Modifier::Check),
+                "cargo fmt --check".into(),
+                10,
+            )],
+        ))];
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_all(
+            &groups,
+            dir.path(),
+            &[CanonicalCommand::Format.with(Modifier::Check)],
+            false,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].cmd, "cargo fmt --check");
     }
 
     #[test]
@@ -928,7 +1424,7 @@ mod tests {
         ))];
 
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "npm run test");
@@ -954,7 +1450,7 @@ mod tests {
         ])];
 
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "yarn run test");
@@ -962,46 +1458,141 @@ mod tests {
     }
 
     #[test]
-    fn canonical_command_from_str() {
+    fn canonical_command_from_name() {
         assert_eq!(
-            "test".parse::<CanonicalCommand>().unwrap(),
-            CanonicalCommand::Test
+            CanonicalCommand::from_name("test"),
+            Some(CanonicalCommand::Test)
         );
         assert_eq!(
-            "install".parse::<CanonicalCommand>().unwrap(),
-            CanonicalCommand::Install
+            CanonicalCommand::from_name("install"),
+            Some(CanonicalCommand::Install)
         );
-        assert!("unknown".parse::<CanonicalCommand>().is_err());
+        assert_eq!(CanonicalCommand::from_name("unknown"), None);
+        assert_eq!(CanonicalCommand::from_name("fix"), None);
+    }
+
+    #[test]
+    fn command_key_all_lists_plain_keys_then_variants() {
+        let all = CommandKey::all();
+        assert_eq!(all.len(), CanonicalCommand::all().len() + 2);
+        assert_eq!(all[0], CanonicalCommand::Install.into());
+        assert!(
+            all[..CanonicalCommand::all().len()]
+                .iter()
+                .all(|k| k.modifier.is_none())
+        );
+        assert_eq!(&all[CanonicalCommand::all().len()..], CommandKey::VARIANTS);
+    }
+
+    #[test]
+    fn variants_of_filters_by_canonical() {
+        let format: Vec<_> = CommandKey::variants_of(CanonicalCommand::Format).collect();
+        assert_eq!(format, vec![CanonicalCommand::Format.with(Modifier::Check)]);
+        assert_eq!(CommandKey::variants_of(CanonicalCommand::Test).count(), 0);
+    }
+
+    #[test]
+    fn keys_sort_plain_before_variant_in_declaration_order() {
+        let mut keys = [
+            CanonicalCommand::Format.with(Modifier::Check),
+            CommandKey::from(CanonicalCommand::Build),
+            CommandKey::from(CanonicalCommand::Format),
+            CanonicalCommand::Lint.with(Modifier::Fix),
+        ];
+        keys.sort();
+        assert_eq!(
+            keys.iter().map(CommandKey::to_string).collect::<Vec<_>>(),
+            ["lint --fix", "format", "format --check", "build"]
+        );
+    }
+
+    #[test]
+    fn tool_index_skips_one_interpreter() {
+        assert_eq!(tool_index(&["eslint", "."]), Some(0));
+        assert_eq!(tool_index(&["npx", "eslint", "."]), Some(1));
+        assert_eq!(tool_index(&["/usr/bin/php", "vendor/bin/pest"]), Some(1));
+        // An interpreter with nothing to launch names no tool.
+        assert_eq!(tool_index(&["npx"]), None);
+        assert_eq!(tool_index(&[]), None);
     }
 
     #[test]
     fn canonical_name_exact_matches() {
-        assert_eq!(map_canonical_name("test"), Some(CanonicalCommand::Test));
-        assert_eq!(map_canonical_name("e2e"), Some(CanonicalCommand::E2e));
-        assert_eq!(map_canonical_name("test:e2e"), Some(CanonicalCommand::E2e));
-        assert_eq!(map_canonical_name("lint"), Some(CanonicalCommand::Lint));
-        assert_eq!(map_canonical_name("check"), Some(CanonicalCommand::Lint));
-        assert_eq!(map_canonical_name("analyse"), Some(CanonicalCommand::Lint));
-        assert_eq!(map_canonical_name("analyze"), Some(CanonicalCommand::Lint));
+        assert_eq!(
+            map_canonical_name("test"),
+            Some(CanonicalCommand::Test.into())
+        );
+        assert_eq!(
+            map_canonical_name("e2e"),
+            Some(CanonicalCommand::E2e.into())
+        );
+        assert_eq!(
+            map_canonical_name("test:e2e"),
+            Some(CanonicalCommand::E2e.into())
+        );
+        assert_eq!(
+            map_canonical_name("lint"),
+            Some(CanonicalCommand::Lint.into())
+        );
+        assert_eq!(
+            map_canonical_name("check"),
+            Some(CanonicalCommand::Lint.into())
+        );
+        assert_eq!(
+            map_canonical_name("analyse"),
+            Some(CanonicalCommand::Lint.into())
+        );
+        assert_eq!(
+            map_canonical_name("analyze"),
+            Some(CanonicalCommand::Lint.into())
+        );
         assert_eq!(
             map_canonical_name("typecheck"),
-            Some(CanonicalCommand::Typecheck)
+            Some(CanonicalCommand::Typecheck.into())
         );
         assert_eq!(
             map_canonical_name("type-check"),
-            Some(CanonicalCommand::Typecheck)
+            Some(CanonicalCommand::Typecheck.into())
         );
-        assert_eq!(map_canonical_name("fix"), Some(CanonicalCommand::Fix));
-        assert_eq!(map_canonical_name("lint:fix"), Some(CanonicalCommand::Fix));
-        assert_eq!(map_canonical_name("lint-fix"), Some(CanonicalCommand::Fix));
-        assert_eq!(map_canonical_name("format"), Some(CanonicalCommand::Format));
-        assert_eq!(map_canonical_name("fmt"), Some(CanonicalCommand::Format));
-        assert_eq!(map_canonical_name("build"), Some(CanonicalCommand::Build));
+        assert_eq!(
+            map_canonical_name("fix"),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
+        );
+        assert_eq!(
+            map_canonical_name("lint:fix"),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
+        );
+        assert_eq!(
+            map_canonical_name("lint-fix"),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
+        );
+        assert_eq!(
+            map_canonical_name("format"),
+            Some(CanonicalCommand::Format.into())
+        );
+        assert_eq!(
+            map_canonical_name("fmt"),
+            Some(CanonicalCommand::Format.into())
+        );
+        for name in ["format:check", "format-check", "fmt:check", "fmt-check"] {
+            assert_eq!(
+                map_canonical_name(name),
+                Some(CanonicalCommand::Format.with(Modifier::Check)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            map_canonical_name("build"),
+            Some(CanonicalCommand::Build.into())
+        );
         assert_eq!(
             map_canonical_name("install"),
-            Some(CanonicalCommand::Install)
+            Some(CanonicalCommand::Install.into())
         );
-        assert_eq!(map_canonical_name("clean"), Some(CanonicalCommand::Clean));
+        assert_eq!(
+            map_canonical_name("clean"),
+            Some(CanonicalCommand::Clean.into())
+        );
         assert_eq!(map_canonical_name("unknown"), None);
     }
 
@@ -1009,27 +1600,27 @@ mod tests {
     fn script_name_exact_matches() {
         assert_eq!(
             map_script_name("test"),
-            Some((CanonicalCommand::Test, ScriptMatchKind::Exact))
+            Some((CanonicalCommand::Test.into(), ScriptMatchKind::Exact))
         );
         assert_eq!(
             map_script_name("lint"),
-            Some((CanonicalCommand::Lint, ScriptMatchKind::Exact))
+            Some((CanonicalCommand::Lint.into(), ScriptMatchKind::Exact))
         );
         assert_eq!(
             map_script_name("check"),
-            Some((CanonicalCommand::Lint, ScriptMatchKind::Exact))
+            Some((CanonicalCommand::Lint.into(), ScriptMatchKind::Exact))
         );
         assert_eq!(
             map_script_name("format"),
-            Some((CanonicalCommand::Format, ScriptMatchKind::Exact))
+            Some((CanonicalCommand::Format.into(), ScriptMatchKind::Exact))
         );
         assert_eq!(
             map_script_name("fmt"),
-            Some((CanonicalCommand::Format, ScriptMatchKind::Exact))
+            Some((CanonicalCommand::Format.into(), ScriptMatchKind::Exact))
         );
         assert_eq!(
             map_script_name("build"),
-            Some((CanonicalCommand::Build, ScriptMatchKind::Exact))
+            Some((CanonicalCommand::Build.into(), ScriptMatchKind::Exact))
         );
     }
 
@@ -1037,37 +1628,61 @@ mod tests {
     fn script_name_prefix_matches() {
         assert_eq!(
             map_script_name("test:unit"),
-            Some((CanonicalCommand::Test, ScriptMatchKind::Prefix))
+            Some((CanonicalCommand::Test.into(), ScriptMatchKind::Prefix))
         );
         assert_eq!(
             map_script_name("lint:fix"),
-            Some((CanonicalCommand::Fix, ScriptMatchKind::Exact))
+            Some((
+                CanonicalCommand::Lint.with(Modifier::Fix),
+                ScriptMatchKind::Exact
+            ))
         );
+        // "format:check" is an exact name for the variant itself.
         assert_eq!(
             map_script_name("format:check"),
-            Some((CanonicalCommand::Format, ScriptMatchKind::Prefix))
+            Some((
+                CanonicalCommand::Format.with(Modifier::Check),
+                ScriptMatchKind::Exact
+            ))
         );
+        // "format:check:*"/"fmt:check:*"/"format-check:*"/"fmt-check:*" are
+        // claimed as prefixes of the variant, before the generic "format:" arm.
+        for name in [
+            "format:check:strict",
+            "fmt:check:strict",
+            "format-check:strict",
+            "fmt-check:strict",
+        ] {
+            assert_eq!(
+                map_script_name(name),
+                Some((
+                    CanonicalCommand::Format.with(Modifier::Check),
+                    ScriptMatchKind::Prefix
+                )),
+                "{name}"
+            );
+        }
         assert_eq!(
             map_script_name("typecheck:ci"),
-            Some((CanonicalCommand::Typecheck, ScriptMatchKind::Prefix))
+            Some((CanonicalCommand::Typecheck.into(), ScriptMatchKind::Prefix))
         );
         assert_eq!(
             map_script_name("type-check:strict"),
-            Some((CanonicalCommand::Typecheck, ScriptMatchKind::Prefix))
+            Some((CanonicalCommand::Typecheck.into(), ScriptMatchKind::Prefix))
         );
         assert_eq!(
             map_script_name("e2e:ui"),
-            Some((CanonicalCommand::E2e, ScriptMatchKind::Prefix))
+            Some((CanonicalCommand::E2e.into(), ScriptMatchKind::Prefix))
         );
         // "test:e2e:*" is claimed by E2e before the generic "test:" arm...
         assert_eq!(
             map_script_name("test:e2e:chrome"),
-            Some((CanonicalCommand::E2e, ScriptMatchKind::Prefix))
+            Some((CanonicalCommand::E2e.into(), ScriptMatchKind::Prefix))
         );
         // ...while other "test:*" names still map to Test.
         assert_eq!(
             map_script_name("test:unit"),
-            Some((CanonicalCommand::Test, ScriptMatchKind::Prefix))
+            Some((CanonicalCommand::Test.into(), ScriptMatchKind::Prefix))
         );
     }
 
@@ -1084,93 +1699,93 @@ mod tests {
     #[test]
     fn infer_php_tools() {
         assert_eq!(
-            infer_from_command("phpunit").canonical(),
-            Some(CanonicalCommand::Test)
+            infer_from_command("phpunit").key(),
+            Some(CanonicalCommand::Test.into())
         );
         assert_eq!(
-            infer_from_command("vendor/bin/pest").canonical(),
-            Some(CanonicalCommand::Test)
+            infer_from_command("vendor/bin/pest").key(),
+            Some(CanonicalCommand::Test.into())
         );
         assert_eq!(
-            infer_from_command("phpstan analyse").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("phpstan analyse").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("vendor/bin/phpstan analyse --level=max").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("vendor/bin/phpstan analyse --level=max").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("psalm").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("psalm").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("phpcs").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("phpcs").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("php-cs-fixer fix").canonical(),
-            Some(CanonicalCommand::Format)
+            infer_from_command("php-cs-fixer fix").key(),
+            Some(CanonicalCommand::Format.into())
         );
         // --dry-run is a format-verify, so no canonical (see php_cs_fixer_dry_run_is_unclassified)
         assert_eq!(
-            infer_from_command("php-cs-fixer fix --dry-run --diff").canonical(),
+            infer_from_command("php-cs-fixer fix --dry-run --diff").key(),
             None
         );
         assert_eq!(
-            infer_from_command("vendor/bin/pint").canonical(),
-            Some(CanonicalCommand::Format)
+            infer_from_command("vendor/bin/pint").key(),
+            Some(CanonicalCommand::Format.into())
         );
         assert_eq!(
-            infer_from_command("phpcbf").canonical(),
-            Some(CanonicalCommand::Format)
+            infer_from_command("phpcbf").key(),
+            Some(CanonicalCommand::Format.into())
         );
     }
 
     #[test]
     fn infer_js_tools() {
         assert_eq!(
-            infer_from_command("jest").canonical(),
-            Some(CanonicalCommand::Test)
+            infer_from_command("jest").key(),
+            Some(CanonicalCommand::Test.into())
         );
         assert_eq!(
-            infer_from_command("vitest run").canonical(),
-            Some(CanonicalCommand::Test)
+            infer_from_command("vitest run").key(),
+            Some(CanonicalCommand::Test.into())
         );
         assert_eq!(
-            infer_from_command("mocha --reporter spec").canonical(),
-            Some(CanonicalCommand::Test)
+            infer_from_command("mocha --reporter spec").key(),
+            Some(CanonicalCommand::Test.into())
         );
         assert_eq!(
-            infer_from_command("eslint .").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("eslint .").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("prettier --write .").canonical(),
-            Some(CanonicalCommand::Format)
+            infer_from_command("prettier --write .").key(),
+            Some(CanonicalCommand::Format.into())
         );
         assert_eq!(
-            infer_from_command("tsc --noEmit").canonical(),
-            Some(CanonicalCommand::Typecheck)
+            infer_from_command("tsc --noEmit").key(),
+            Some(CanonicalCommand::Typecheck.into())
         );
         assert_eq!(
-            infer_from_command("tsc").canonical(),
-            Some(CanonicalCommand::Build)
+            infer_from_command("tsc").key(),
+            Some(CanonicalCommand::Build.into())
         );
         assert_eq!(
-            infer_from_command("tsc -p tsconfig.json").canonical(),
-            Some(CanonicalCommand::Build)
+            infer_from_command("tsc -p tsconfig.json").key(),
+            Some(CanonicalCommand::Build.into())
         );
     }
 
     #[test]
     fn infer_e2e_tools() {
         assert_eq!(
-            infer_from_command("playwright test").canonical(),
-            Some(CanonicalCommand::E2e)
+            infer_from_command("playwright test").key(),
+            Some(CanonicalCommand::E2e.into())
         );
         assert_eq!(
-            infer_from_command("cypress run").canonical(),
-            Some(CanonicalCommand::E2e)
+            infer_from_command("cypress run").key(),
+            Some(CanonicalCommand::E2e.into())
         );
         // Non-run subcommands stay unclassified: install/codegen aren't suite
         // runs, and `cypress open` is the interactive runner.
@@ -1184,11 +1799,11 @@ mod tests {
     fn infer_biome_subcommands() {
         assert_eq!(
             infer_from_command("biome check ."),
-            Inference::Canonical(CanonicalCommand::Lint)
+            Inference::Canonical(CanonicalCommand::Lint.into())
         );
         assert_eq!(
             infer_from_command("biome lint ."),
-            Inference::Canonical(CanonicalCommand::Lint)
+            Inference::Canonical(CanonicalCommand::Lint.into())
         );
         assert_eq!(infer_from_command("biome"), Inference::Unknown);
     }
@@ -1205,31 +1820,31 @@ mod tests {
         // `--write` is the standard write flag; `--fix` is its v2 alias.
         assert_eq!(
             infer_from_command("biome format --write"),
-            Inference::Canonical(CanonicalCommand::Format)
+            Inference::Canonical(CanonicalCommand::Format.into())
         );
         assert_eq!(
             infer_from_command("biome format --fix ."),
-            Inference::Canonical(CanonicalCommand::Format)
+            Inference::Canonical(CanonicalCommand::Format.into())
         );
     }
 
     #[test]
     fn infer_interpreter_prefixes() {
         assert_eq!(
-            infer_from_command("php vendor/bin/phpstan analyse").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("php vendor/bin/phpstan analyse").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("node jest").canonical(),
-            Some(CanonicalCommand::Test)
+            infer_from_command("node jest").key(),
+            Some(CanonicalCommand::Test.into())
         );
         assert_eq!(
-            infer_from_command("npx eslint .").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("npx eslint .").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("bunx vitest").canonical(),
-            Some(CanonicalCommand::Test)
+            infer_from_command("bunx vitest").key(),
+            Some(CanonicalCommand::Test.into())
         );
     }
 
@@ -1244,19 +1859,19 @@ mod tests {
     fn map_script_name_and_content_agree() {
         assert_eq!(
             map_script("test", "phpunit"),
-            Some((CanonicalCommand::Test, 10))
+            Some((CanonicalCommand::Test.into(), 10))
         );
         assert_eq!(
             map_script("lint", "eslint ."),
-            Some((CanonicalCommand::Lint, 10))
+            Some((CanonicalCommand::Lint.into(), 10))
         );
         assert_eq!(
             map_script("typecheck", "tsc --noEmit"),
-            Some((CanonicalCommand::Typecheck, 10))
+            Some((CanonicalCommand::Typecheck.into(), 10))
         );
         assert_eq!(
             map_script("e2e", "playwright test"),
-            Some((CanonicalCommand::E2e, 10))
+            Some((CanonicalCommand::E2e.into(), 10))
         );
     }
 
@@ -1266,7 +1881,7 @@ mod tests {
         // the disagree priority; `letme test` must not trigger e2e runs.
         assert_eq!(
             map_script("test", "playwright test"),
-            Some((CanonicalCommand::E2e, 3))
+            Some((CanonicalCommand::E2e.into(), 3))
         );
     }
 
@@ -1274,7 +1889,7 @@ mod tests {
     fn map_script_name_and_content_disagree() {
         assert_eq!(
             map_script("format", "eslint ."),
-            Some((CanonicalCommand::Lint, 3))
+            Some((CanonicalCommand::Lint.into(), 3))
         );
     }
 
@@ -1290,12 +1905,12 @@ mod tests {
         // name is compatible with a format-verify, so map_script trusts the name.
         assert_eq!(
             map_script("lint", "php-cs-fixer fix --dry-run --diff"),
-            Some((CanonicalCommand::Lint, 10))
+            Some((CanonicalCommand::Lint.into(), 10))
         );
         // Without --dry-run it's still Format
         assert_eq!(
             infer_from_command("php-cs-fixer fix"),
-            Inference::Canonical(CanonicalCommand::Format)
+            Inference::Canonical(CanonicalCommand::Format.into())
         );
     }
 
@@ -1305,36 +1920,56 @@ mod tests {
         assert_eq!(infer_from_command("pint --test"), Inference::FormatVerify);
         assert_eq!(
             infer_from_command("pint"),
-            Inference::Canonical(CanonicalCommand::Format)
+            Inference::Canonical(CanonicalCommand::Format.into())
         );
     }
 
     #[test]
-    fn format_named_script_running_a_check_is_suppressed() {
-        // A script named "format" that only verifies cannot satisfy the Format
-        // canonical; leave the slot empty so a lower tier can supply a real
-        // formatter (e.g. tier-4 `biome format --write`).
-        assert_eq!(map_script("format", "biome format"), None);
-        assert_eq!(map_script("format", "prettier --check ."), None);
-        assert_eq!(map_script("format", "php-cs-fixer fix --dry-run"), None);
-        assert_eq!(map_script("fmt", "pint --test"), None);
-        // Prefix names too: "format:check" claims Format via prefix match.
-        assert_eq!(map_script("format:check", "biome format"), None);
-        // Same for a name claiming the other mutating canonical.
-        assert_eq!(map_script("fix", "biome format"), None);
-        // But a check-shaped name is fine, since it promises no mutation.
+    fn format_named_script_running_a_check_is_rehomed_to_the_variant() {
+        // A script named "format" that only verifies cannot satisfy plain
+        // Format, but the content really is a check: rehome to the variant
+        // instead of dropping it, at the disagree-with-name priority.
+        assert_eq!(
+            map_script("format", "biome format"),
+            Some((CanonicalCommand::Format.with(Modifier::Check), 3))
+        );
+        assert_eq!(
+            map_script("format", "prettier --check ."),
+            Some((CanonicalCommand::Format.with(Modifier::Check), 3))
+        );
+        assert_eq!(
+            map_script("format", "php-cs-fixer fix --dry-run"),
+            Some((CanonicalCommand::Format.with(Modifier::Check), 3))
+        );
+        assert_eq!(
+            map_script("fmt", "pint --test"),
+            Some((CanonicalCommand::Format.with(Modifier::Check), 3))
+        );
+        // "format:check" is an exact name for the variant itself, so name and
+        // content agree at the full exact priority.
+        assert_eq!(
+            map_script("format:check", "biome format"),
+            Some((CanonicalCommand::Format.with(Modifier::Check), 10))
+        );
+        // "fix" also claims to write (via lint --fix); a check-only body
+        // rehomes there too, same as plain "format".
+        assert_eq!(
+            map_script("fix", "biome format"),
+            Some((CanonicalCommand::Format.with(Modifier::Check), 3))
+        );
+        // A check-shaped name is fine either way, since it promises no mutation.
         assert_eq!(
             map_script("lint", "biome format"),
-            Some((CanonicalCommand::Lint, 10))
+            Some((CanonicalCommand::Lint.into(), 10))
         );
         assert_eq!(
             map_script("check", "prettier --check ."),
-            Some((CanonicalCommand::Lint, 10))
+            Some((CanonicalCommand::Lint.into(), 10))
         );
         // And a real write still resolves normally.
         assert_eq!(
             map_script("format", "biome format --write"),
-            Some((CanonicalCommand::Format, 10))
+            Some((CanonicalCommand::Format.into(), 10))
         );
     }
 
@@ -1343,12 +1978,12 @@ mod tests {
         // "analyse" is a name alias, so it gets the full name-match priority.
         assert_eq!(
             map_script("analyse", "phpstan analyse"),
-            Some((CanonicalCommand::Lint, 10))
+            Some((CanonicalCommand::Lint.into(), 10))
         );
         // "cs" matches no name; the content alone carries it at priority 7.
         assert_eq!(
             map_script("cs", "prettier --write ."),
-            Some((CanonicalCommand::Format, 7))
+            Some((CanonicalCommand::Format.into(), 7))
         );
     }
 
@@ -1362,7 +1997,7 @@ mod tests {
     fn map_script_prefix_match() {
         assert_eq!(
             map_script("test:unit", "jest --unit"),
-            Some((CanonicalCommand::Test, 5))
+            Some((CanonicalCommand::Test.into(), 5))
         );
     }
 
@@ -1370,7 +2005,7 @@ mod tests {
     fn map_script_name_only_no_content() {
         assert_eq!(
             map_script("test", "some-custom-runner"),
-            Some((CanonicalCommand::Test, 10))
+            Some((CanonicalCommand::Test.into(), 10))
         );
     }
 
@@ -1419,7 +2054,7 @@ mod tests {
         ))];
 
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result = resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert!(result.is_empty());
     }
@@ -1428,54 +2063,71 @@ mod tests {
     fn script_name_fix_prefix() {
         assert_eq!(
             map_script_name("fix:lint"),
-            Some((CanonicalCommand::Fix, ScriptMatchKind::Prefix))
+            Some((
+                CanonicalCommand::Lint.with(Modifier::Fix),
+                ScriptMatchKind::Prefix
+            ))
         );
+    }
+
+    #[test]
+    fn script_name_lint_fix_prefix() {
+        for name in ["lint:fix:strict", "lint-fix:strict"] {
+            assert_eq!(
+                map_script_name(name),
+                Some((
+                    CanonicalCommand::Lint.with(Modifier::Fix),
+                    ScriptMatchKind::Prefix
+                )),
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn infer_eslint_fix() {
         assert_eq!(
-            infer_from_command("eslint --fix .").canonical(),
-            Some(CanonicalCommand::Fix)
+            infer_from_command("eslint --fix .").key(),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
         );
         // Without --fix, still Lint
         assert_eq!(
-            infer_from_command("eslint .").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("eslint .").key(),
+            Some(CanonicalCommand::Lint.into())
         );
     }
 
     #[test]
     fn infer_oxlint_fix() {
         assert_eq!(
-            infer_from_command("oxlint --fix").canonical(),
-            Some(CanonicalCommand::Fix)
+            infer_from_command("oxlint --fix").key(),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
         );
         // Without --fix, still Lint
         assert_eq!(
-            infer_from_command("oxlint").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("oxlint").key(),
+            Some(CanonicalCommand::Lint.into())
         );
     }
 
     #[test]
     fn infer_biome_fix() {
         assert_eq!(
-            infer_from_command("biome check --fix .").canonical(),
-            Some(CanonicalCommand::Fix)
+            infer_from_command("biome check --fix .").key(),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
         );
         assert_eq!(
-            infer_from_command("biome lint --apply .").canonical(),
-            Some(CanonicalCommand::Fix)
+            infer_from_command("biome lint --apply .").key(),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
         );
         assert_eq!(
-            infer_from_command("biome lint --write .").canonical(),
-            Some(CanonicalCommand::Fix)
+            infer_from_command("biome lint --write .").key(),
+            Some(CanonicalCommand::Lint.with(Modifier::Fix))
         );
         // Without fix flags, still Lint
         assert_eq!(
-            infer_from_command("biome check .").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("biome check .").key(),
+            Some(CanonicalCommand::Lint.into())
         );
     }
 
@@ -1483,7 +2135,7 @@ mod tests {
     fn map_script_fix_with_fix_content() {
         assert_eq!(
             map_script("fix", "eslint --fix ."),
-            Some((CanonicalCommand::Fix, 10))
+            Some((CanonicalCommand::Lint.with(Modifier::Fix), 10))
         );
     }
 
@@ -1511,6 +2163,23 @@ mod tests {
     }
 
     #[test]
+    fn split_compound_with_ops_trailing_separator_keeps_the_invariant() {
+        // A dangling operator (its right-hand segment is empty) is dropped,
+        // so `ops.len() == parts.len() - 1` holds even here.
+        let (parts, ops) = split_compound_command_with_ops("prettier -w .;");
+        assert_eq!(parts, vec!["prettier -w ."]);
+        assert_eq!(ops.len(), parts.len() - 1);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn split_compound_with_ops_matches_parts_for_a_normal_chain() {
+        let (parts, ops) = split_compound_command_with_ops("a && b || c");
+        assert_eq!(parts, vec!["a", "b", "c"]);
+        assert_eq!(ops, vec![CompoundOp::And, CompoundOp::Or]);
+    }
+
+    #[test]
     fn split_compound_pipe_does_not_split() {
         // Pipes are part of a single logical command
         assert_eq!(
@@ -1534,12 +2203,12 @@ mod tests {
     #[test]
     fn infer_compound_all_agree() {
         assert_eq!(
-            infer_from_command("prettier --write . && prettier --write src/").canonical(),
-            Some(CanonicalCommand::Format)
+            infer_from_command("prettier --write . && prettier --write src/").key(),
+            Some(CanonicalCommand::Format.into())
         );
         assert_eq!(
-            infer_from_command("eslint . && phpstan analyse").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("eslint . && phpstan analyse").key(),
+            Some(CanonicalCommand::Lint.into())
         );
     }
 
@@ -1548,22 +2217,23 @@ mod tests {
         // prettier --check is a format-verify; a recognized canonical wins over
         // one, so only eslint's Lint carries.
         assert_eq!(
-            infer_from_command("prettier --check . && eslint .").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("prettier --check . && eslint .").key(),
+            Some(CanonicalCommand::Lint.into())
         );
     }
 
     #[test]
     fn infer_compound_all_format_verify() {
         // No canonical anywhere, but every recognized part is a format-verify, so
-        // the compound is itself a format-verify and a "format" name is suppressed.
+        // the compound is itself a format-verify, which rehomes a plain
+        // "format" name to the check variant.
         assert_eq!(
             infer_from_command("prettier --check . && biome format"),
             Inference::FormatVerify
         );
         assert_eq!(
             map_script("format", "prettier --check . && biome format"),
-            None
+            Some((CanonicalCommand::Format.with(Modifier::Check), 3))
         );
     }
 
@@ -1580,8 +2250,8 @@ mod tests {
     fn infer_compound_with_unknown_parts() {
         // Only eslint is recognized, so its Lint carries.
         assert_eq!(
-            infer_from_command("custom-tool && eslint .").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("custom-tool && eslint .").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         // Nothing recognized at all.
         assert_eq!(
@@ -1592,14 +2262,13 @@ mod tests {
 
     #[test]
     fn infer_single_command_unchanged() {
-        // Regression: single commands still work
         assert_eq!(
-            infer_from_command("eslint .").canonical(),
-            Some(CanonicalCommand::Lint)
+            infer_from_command("eslint .").key(),
+            Some(CanonicalCommand::Lint.into())
         );
         assert_eq!(
-            infer_from_command("prettier --write .").canonical(),
-            Some(CanonicalCommand::Format)
+            infer_from_command("prettier --write .").key(),
+            Some(CanonicalCommand::Format.into())
         );
         assert_eq!(infer_from_command(""), Inference::Unknown);
     }
@@ -1609,7 +2278,7 @@ mod tests {
         // The format-verify part is invisible, so content agrees with the name.
         assert_eq!(
             map_script("lint", "prettier --check . && eslint"),
-            Some((CanonicalCommand::Lint, 10))
+            Some((CanonicalCommand::Lint.into(), 10))
         );
     }
 
@@ -1618,7 +2287,153 @@ mod tests {
         // Same with npx prefix
         assert_eq!(
             map_script("lint", "npx prettier . --check && eslint"),
-            Some((CanonicalCommand::Lint, 10))
+            Some((CanonicalCommand::Lint.into(), 10))
         );
+    }
+
+    fn synth(body: &str) -> Option<String> {
+        synthesize_variant(CanonicalCommand::Format.with(Modifier::Check), body)
+            .map(|v| v.render(|part| part.to_string()))
+    }
+
+    #[test]
+    fn synthesize_prettier_preserves_paths_and_flags() {
+        assert_eq!(
+            synth("prettier -w src"),
+            Some("prettier --check src".to_string())
+        );
+        assert_eq!(synth("prettier"), Some("prettier --check".to_string()));
+    }
+
+    #[test]
+    fn synthesize_pass_through_lets_a_plain_lint_part_ride_along() {
+        assert_eq!(
+            synth("prettier -w . && eslint ."),
+            Some("prettier --check . && eslint .".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesize_declines_a_writing_foreign_part() {
+        assert_eq!(synth("prettier -w . && eslint --fix ."), None);
+    }
+
+    #[test]
+    fn synthesize_declines_when_nothing_is_transformed() {
+        // "phpstan analyse" is plain Lint, which passes through, but there is
+        // no Format part to transform.
+        assert_eq!(synth("phpstan analyse"), None);
+    }
+
+    #[test]
+    fn synthesize_declines_unknown_content() {
+        assert_eq!(synth("next lint"), None);
+    }
+
+    #[test]
+    fn synthesize_declines_a_standalone_check_with_nothing_to_transform() {
+        assert_eq!(synth("prettier --check ."), None);
+    }
+
+    #[test]
+    fn synthesize_biome_format_drops_the_write_flag() {
+        assert_eq!(
+            synth("biome format --write"),
+            Some("biome format".to_string())
+        );
+        assert_eq!(
+            synth("biome format --fix ."),
+            Some("biome format .".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesize_php_cs_fixer_inserts_dry_run_and_diff_after_fix() {
+        assert_eq!(
+            synth("vendor/bin/php-cs-fixer fix"),
+            Some("vendor/bin/php-cs-fixer fix --dry-run --diff".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesize_php_cs_fixer_finds_fix_after_an_interpreter_prefix() {
+        // The subcommand search starts after the tool token, so it still
+        // finds "fix" when the tool itself is interpreter-prefixed.
+        assert_eq!(
+            synth("php vendor/bin/php-cs-fixer fix"),
+            Some("php vendor/bin/php-cs-fixer fix --dry-run --diff".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesize_php_cs_fixer_declines_without_a_fix_subcommand() {
+        assert_eq!(synth("vendor/bin/php-cs-fixer"), None);
+    }
+
+    #[test]
+    fn synthesize_pint_appends_test_flag() {
+        assert_eq!(synth("pint"), Some("pint --test".to_string()));
+    }
+
+    #[test]
+    fn synthesize_declines_a_composite_that_is_already_the_variant() {
+        // Every part already checks: nothing to transform, so this declines
+        // the same way a fully-satisfied body does.
+        assert_eq!(synth("prettier --check . && pint --test"), None);
+    }
+
+    fn synth_fix(body: &str) -> Option<String> {
+        synthesize_variant(CanonicalCommand::Lint.with(Modifier::Fix), body)
+            .map(|v| v.render(|part| part.to_string()))
+    }
+
+    #[test]
+    fn synthesize_lint_fix_mirrors_the_script() {
+        // No "." added: the script is mirrored exactly, matching tier 4's
+        // own template only when the script already has one.
+        assert_eq!(synth_fix("eslint"), Some("eslint --fix".to_string()));
+        assert_eq!(synth_fix("oxlint"), Some("oxlint --fix".to_string()));
+    }
+
+    #[test]
+    fn synthesize_lint_fix_pass_through_lets_a_format_verify_part_ride_along() {
+        assert_eq!(
+            synth_fix("eslint . && prettier --check ."),
+            Some("eslint --fix . && prettier --check .".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesize_lint_fix_pass_through_lets_typecheck_ride_along() {
+        assert_eq!(
+            synth_fix("eslint . && tsc --noEmit"),
+            Some("eslint --fix . && tsc --noEmit".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesize_lint_fix_declines_a_writing_foreign_part() {
+        // "format" (plain, writing) is not eligible to ride along under
+        // Lint→Fix, unlike under Format→Check where Lint rides along.
+        assert_eq!(synth_fix("eslint . && prettier -w ."), None);
+    }
+
+    #[test]
+    fn synthesize_biome_lint_fix_inserts_after_the_subcommand() {
+        assert_eq!(
+            synth_fix("biome check ."),
+            Some("biome check --fix .".to_string())
+        );
+        assert_eq!(
+            synth_fix("biome lint"),
+            Some("biome lint --fix".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesize_lint_fix_declines_cross_binary_rewrites() {
+        assert_eq!(synth_fix("phpstan analyse"), None);
+        assert_eq!(synth_fix("next lint"), None);
+        assert_eq!(synth_fix("eslint --fix ."), None);
     }
 }

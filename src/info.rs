@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::config::Config;
-use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
+use crate::detect::{self, CommandKey, DetectorGroup, ResolvedCommand};
 use crate::local_config::{FILE_NAME, LocalConfig};
 use crate::theme::{Theme, sanitize};
 
@@ -64,18 +64,22 @@ pub fn show(
 
     println!();
 
-    let commands = local.enabled(CanonicalCommand::all(), verbose);
-    let resolved = detect::resolve_all(groups, dir, &commands, verbose);
+    let keys = local.enabled(&CommandKey::all(), verbose);
+    let resolved = detect::resolve_all(groups, dir, &keys, verbose);
 
-    let mut by_command: BTreeMap<String, Vec<&ResolvedCommand>> = BTreeMap::new();
+    let mut by_command: BTreeMap<CommandKey, Vec<&ResolvedCommand>> = BTreeMap::new();
     for cmd in &resolved {
-        by_command
-            .entry(cmd.canonical.to_string())
-            .or_default()
-            .push(cmd);
+        by_command.entry(cmd.key).or_default().push(cmd);
     }
 
-    let disabled: BTreeSet<String> = local.disabled.iter().map(|c| c.to_string()).collect();
+    // Disabled commands are filtered out before resolution, so they are never
+    // in `by_command`; they get their own row from here.
+    let disabled: BTreeSet<CommandKey> = local
+        .disabled
+        .iter()
+        .copied()
+        .map(CommandKey::from)
+        .collect();
 
     if by_command.is_empty() && disabled.is_empty() {
         println!("{}", "No canonical commands resolved.".style(theme.muted));
@@ -91,19 +95,16 @@ pub fn show(
 }
 
 fn render_commands(
-    by_command: &BTreeMap<String, Vec<&ResolvedCommand>>,
-    disabled: &BTreeSet<String>,
+    by_command: &BTreeMap<CommandKey, Vec<&ResolvedCommand>>,
+    disabled: &BTreeSet<CommandKey>,
     theme: &Theme,
 ) -> String {
-    let names: BTreeSet<&str> = by_command
-        .keys()
-        .chain(disabled.iter())
-        .map(String::as_str)
-        .collect();
+    let keys: BTreeSet<CommandKey> = by_command.keys().chain(disabled.iter()).copied().collect();
 
     let mut out = String::new();
-    for name in names {
-        if disabled.contains(name) {
+    for key in keys {
+        let name = key.to_string();
+        if disabled.contains(&key) {
             out.push_str(&format!(
                 "  {} {}\n    {} {}\n",
                 "letme".style(theme.muted),
@@ -118,7 +119,7 @@ fn render_commands(
             "letme".style(theme.muted),
             name.style(theme.command)
         ));
-        for cmd in &by_command[name] {
+        for cmd in &by_command[&key] {
             if cmd.label != cmd.cmd {
                 out.push_str(&format!(
                     "    {} {} {} {}\n",
@@ -142,10 +143,14 @@ fn render_commands(
 
 fn show_aliases(
     aliases: &std::collections::HashMap<String, Vec<String>>,
-    by_command: &BTreeMap<String, Vec<&ResolvedCommand>>,
+    by_command: &BTreeMap<CommandKey, Vec<&ResolvedCommand>>,
     theme: &Theme,
 ) {
     if !aliases.is_empty() {
+        // Alias values are written the way a key prints ("lint", "lint --fix"),
+        // so they're matched against the resolved keys' own spelling.
+        let resolved: BTreeSet<String> = by_command.keys().map(CommandKey::to_string).collect();
+
         println!();
         println!("{}", "Aliases:".style(theme.header));
         let mut sorted: Vec<_> = aliases.iter().collect();
@@ -154,7 +159,7 @@ fn show_aliases(
             let styled_commands: Vec<String> = expansion
                 .iter()
                 .map(|cmd| {
-                    if by_command.contains_key(cmd.as_str()) {
+                    if resolved.contains(cmd.as_str()) {
                         format!("{}", cmd.style(theme.info))
                     } else {
                         format!("{}", cmd.style(theme.disabled))
@@ -175,11 +180,11 @@ fn show_aliases(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::{Ecosystem, Tier};
+    use crate::detect::{CanonicalCommand, Ecosystem, Tier};
 
     fn rc(canonical: CanonicalCommand, cmd: &str) -> ResolvedCommand {
         ResolvedCommand {
-            canonical,
+            key: CommandKey::from(canonical),
             cmd: cmd.to_string(),
             label: cmd.to_string(),
             tier: Tier::Tier4,
@@ -187,27 +192,55 @@ mod tests {
             detector_name: "test".to_string(),
             priority: 10,
             covered_by: None,
+            note: None,
         }
     }
 
     #[test]
     fn render_commands_shows_disabled_row_with_source() {
         let test_cmd = rc(CanonicalCommand::Test, "cargo test");
-        let by_command = BTreeMap::from([("test".to_string(), vec![&test_cmd])]);
-        let disabled = BTreeSet::from(["format".to_string()]);
+        let by_command =
+            BTreeMap::from([(CommandKey::from(CanonicalCommand::Test), vec![&test_cmd])]);
+        let disabled = BTreeSet::from([CommandKey::from(CanonicalCommand::Format)]);
         let out = render_commands(&by_command, &disabled, &Theme::plain());
 
-        let expected = "  letme format
-    ⊘ disabled (.letme.local.toml)
-  letme test
+        // Rows follow key order (canonical declaration order), not
+        // alphabetical order.
+        let expected = "  letme test
     → cargo test [convention, test]
+  letme format
+    ⊘ disabled (.letme.local.toml)
+";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn render_commands_orders_a_variant_right_after_its_plain_key() {
+        let format = rc(CanonicalCommand::Format, "cargo fmt");
+        let mut check = rc(CanonicalCommand::Format, "cargo fmt --check");
+        check.key = CanonicalCommand::Format.with(crate::detect::Modifier::Check);
+        let build = rc(CanonicalCommand::Build, "cargo build");
+        let by_command = BTreeMap::from([
+            (build.key, vec![&build]),
+            (check.key, vec![&check]),
+            (format.key, vec![&format]),
+        ]);
+
+        let out = render_commands(&by_command, &BTreeSet::new(), &Theme::plain());
+
+        let expected = "  letme format
+    → cargo fmt [convention, test]
+  letme format --check
+    → cargo fmt --check [convention, test]
+  letme build
+    → cargo build [convention, test]
 ";
         assert_eq!(out, expected);
     }
 
     #[test]
     fn render_commands_handles_all_disabled_project() {
-        let disabled = BTreeSet::from(["format".to_string()]);
+        let disabled = BTreeSet::from([CommandKey::from(CanonicalCommand::Format)]);
         let out = render_commands(&BTreeMap::new(), &disabled, &Theme::plain());
         assert!(out.contains("letme format"), "got: {out}");
         assert!(out.contains("disabled (.letme.local.toml)"), "got: {out}");

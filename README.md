@@ -14,14 +14,16 @@ or `npm run test:unit` costs a little time and focus, twenty times a day.
 
 `letme` maps whatever tooling it finds to a fixed set of canonical commands:
 
-`install`, `test`, `e2e`, `lint`, `typecheck`, `fix`, `format`, `build`, `clean`
+`install`, `test`, `e2e`, `lint`, `typecheck`, `format`, `build`, `clean`
 
 ```sh
-letme test          # run the detected test command
-letme lint test     # chain commands; stops on the first failure
-letme te            # unambiguous prefixes work too
-letme ok            # your own alias, see Configuration
-letme clean -i      # confirm each command before it runs
+letme test            # run the detected test command
+letme lint test       # chain commands; stops on the first failure
+letme lint --fix      # auto-fix what the linter can fix
+letme format --check  # check formatting without writing
+letme te              # unambiguous prefixes work too
+letme ok              # your own alias, see Configuration
+letme clean -i        # confirm each command before it runs
 ```
 
 In a chain, commands that don't resolve for the current project are skipped
@@ -68,7 +70,8 @@ $ letme doctor
 ```
 
 The checks are file-based (existence and mtime comparisons), so they are fast
-but not exhaustive.
+but not exhaustive. `doctor` always runs on its own: it can't be chained with
+other commands or used in an alias, and it doesn't match by prefix.
 
 ## How detection works
 
@@ -92,6 +95,12 @@ it, per command:
 If a project mixes ecosystems (say Rust plus JavaScript), `letme test` runs
 the test commands of both.
 
+`lint --fix` and `format --check` are detected the same way, from tasks or
+scripts named like `lint:fix` or `format:check`. Without one, letme rewrites a
+recognized plain script instead (`prettier --write .` becomes
+`prettier --check .`). A variant never comes from a lower tier than its plain
+command, so `format` and `format --check` always use the same formatter.
+
 ## Installation
 
 Not on crates.io yet; install from the repo (needs a Rust toolchain):
@@ -106,9 +115,10 @@ Optional, lives at `~/.config/letme/config.toml`:
 
 ```toml
 [aliases]
-ok = ["format", "lint", "typecheck", "test"]   # what I run before every commit
-t  = ["test"]                                  # make the ambiguous "t" prefix work
-ci = ["lint", "typecheck", "test", "build"]
+ok   = ["format", "lint", "typecheck", "test"]  # what I run before every commit
+t    = ["test"]                                 # make the ambiguous "t" prefix work
+ci   = ["lint", "typecheck", "test", "build"]
+tidy = ["lint --fix", "format"]                 # an entry can carry its command's flag
 ```
 
 Aliases may reference other aliases, and their names take part in prefix
@@ -123,6 +133,8 @@ To keep a detected command from running in a specific repo, drop a
 ```toml
 disable = ["format"]
 ```
+
+Disabling `lint` also disables `lint --fix`.
 
 ## Status
 

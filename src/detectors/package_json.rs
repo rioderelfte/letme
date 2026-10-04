@@ -58,16 +58,40 @@ impl Detector for PackageJsonDetector {
 
         if let Some(scripts) = read_package_json_scripts(dir) {
             for (name, value) in &scripts {
-                if let Some((canonical, priority)) = map_script(name, value) {
+                if let Some((key, priority)) = map_script(name, value) {
                     let cmd = format!("{} {name}", self.manager.run_prefix());
-                    let mut rc = self.make_command(canonical, cmd, priority);
+                    let mut rc = self.make_command(key, cmd, priority);
                     rc.label = value.clone();
                     commands.push(rc);
+                }
+
+                for &target in CommandKey::VARIANTS {
+                    if let Some(variant) = synthesize_variant(target, value) {
+                        let cmd = variant.render(|part| self.exec_prefixed(part));
+                        let mut rc = self.make_command(variant.key, cmd.clone(), 2);
+                        rc.label = cmd;
+                        rc.note = Some(format!("synthesized from '{name}' script"));
+                        commands.push(rc);
+                    }
                 }
             }
         }
 
         commands
+    }
+}
+
+impl PackageJsonDetector {
+    /// A synthesized part that already starts with an interpreter has its own
+    /// way of resolving the binary, and doesn't need the package manager's
+    /// exec prefix in front of it too.
+    fn exec_prefixed(&self, part: &str) -> String {
+        let first = part.split_whitespace().next().unwrap_or("");
+        if INTERPRETERS.contains(&basename(first)) {
+            part.to_string()
+        } else {
+            format!("{} {part}", self.manager.exec_prefix())
+        }
     }
 }
 
@@ -154,19 +178,19 @@ mod tests {
 
             let test_cmd = commands
                 .iter()
-                .find(|c| c.canonical == CanonicalCommand::Test)
+                .find(|c| c.key.canonical == CanonicalCommand::Test)
                 .unwrap();
             assert_eq!(test_cmd.cmd, run);
 
             let install_cmd = commands
                 .iter()
-                .find(|c| c.canonical == CanonicalCommand::Install)
+                .find(|c| c.key.canonical == CanonicalCommand::Install)
                 .unwrap();
             assert_eq!(install_cmd.cmd, install);
 
             let clean_cmd = commands
                 .iter()
-                .find(|c| c.canonical == CanonicalCommand::Clean)
+                .find(|c| c.key.canonical == CanonicalCommand::Clean)
                 .unwrap();
             assert_eq!(clean_cmd.cmd, "rm -rf node_modules");
         }
@@ -214,7 +238,7 @@ mod tests {
 
         let test_commands: Vec<_> = commands
             .iter()
-            .filter(|c| c.canonical == CanonicalCommand::Test)
+            .filter(|c| c.key.canonical == CanonicalCommand::Test)
             .collect();
 
         assert_eq!(test_commands.len(), 2);
@@ -245,19 +269,19 @@ mod tests {
 
         // The lint name carries it; the content is only a format-verify.
         let lint_cmd = commands.iter().find(|c| c.cmd == "npm run lint").unwrap();
-        assert_eq!(lint_cmd.canonical, CanonicalCommand::Lint);
+        assert_eq!(lint_cmd.key.canonical, CanonicalCommand::Lint);
         assert_eq!(lint_cmd.priority, 10);
 
         let format_cmd = commands.iter().find(|c| c.cmd == "npm run format").unwrap();
-        assert_eq!(format_cmd.canonical, CanonicalCommand::Format);
+        assert_eq!(format_cmd.key.canonical, CanonicalCommand::Format);
         assert_eq!(format_cmd.priority, 10);
     }
 
     #[test]
-    fn check_only_format_script_yields_no_format_command() {
-        // `"format": "biome format"` only reports; it never writes, so pnpm
-        // must not claim the Format slot. With no tier-3 candidate, resolution
-        // falls through to the tier-4 biome detector's `biome format --write`.
+    fn check_only_format_script_yields_no_plain_format_command() {
+        // `"format": "biome format"` never writes, so pnpm must not claim the
+        // plain Format slot (it falls through to the tier-4 biome detector).
+        // The check-only body is rehomed to the check variant instead.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
         std::fs::write(
@@ -271,9 +295,15 @@ mod tests {
         assert!(
             !commands
                 .iter()
-                .any(|c| c.canonical == CanonicalCommand::Format),
-            "pnpm should not offer a Format command for a check-only script"
+                .any(|c| c.key == CommandKey::from(CanonicalCommand::Format)),
+            "pnpm should not offer a plain Format command for a check-only script"
         );
+        let format_check = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
+            .unwrap();
+        assert_eq!(format_check.cmd, "pnpm run format");
+        assert_eq!(format_check.priority, 3);
         // Sibling scripts are unaffected.
         assert!(commands.iter().any(|c| c.cmd == "pnpm run lint"));
         assert!(commands.iter().any(|c| c.cmd == "pnpm run test"));
@@ -300,7 +330,8 @@ mod tests {
             Box::new(AssumeInstalled(detector(Yarn))),
             Box::new(AssumeInstalled(detector(Npm))),
         ])];
-        let result = detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result =
+            detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].detector_name, "yarn");
@@ -331,7 +362,8 @@ mod tests {
             Box::new(AssumeInstalled(detector(Yarn))),
             Box::new(AssumeInstalled(detector(Npm))),
         ])];
-        let result = detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Test], false);
+        let result =
+            detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Test.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].detector_name, "pnpm");
@@ -357,8 +389,12 @@ mod tests {
         let groups = vec![detect::DetectorGroup::new(vec![
             Box::new(AssumeInstalled(detector(Pnpm))) as Box<dyn Detector>,
         ])];
-        let result =
-            detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Typecheck], false);
+        let result = detect::resolve_all(
+            &groups,
+            dir.path(),
+            &[CanonicalCommand::Typecheck.into()],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "pnpm run type-check");
@@ -391,8 +427,12 @@ mod tests {
             ]),
             detect::DetectorGroup::new(vec![Box::new(TscDetector) as Box<dyn Detector>]),
         ];
-        let result =
-            detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Typecheck], false);
+        let result = detect::resolve_all(
+            &groups,
+            dir.path(),
+            &[CanonicalCommand::Typecheck.into()],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "pnpm run typecheck");
@@ -426,10 +466,93 @@ mod tests {
             ]),
             detect::DetectorGroup::new(vec![Box::new(PlaywrightDetector) as Box<dyn Detector>]),
         ];
-        let result = detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::E2e], false);
+        let result =
+            detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::E2e.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "pnpm run e2e");
         assert_eq!(result[0].detector_name, "pnpm");
+    }
+
+    #[test]
+    fn synthesizes_format_check_from_a_plain_format_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"format": "prettier -w src"}}"#,
+        )
+        .unwrap();
+
+        let commands = detector(Npm).resolve_commands(dir.path());
+
+        let synthesized = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
+            .unwrap();
+        assert_eq!(synthesized.cmd, "npx prettier --check src");
+        assert_eq!(synthesized.priority, 2);
+        assert_eq!(
+            synthesized.note.as_deref(),
+            Some("synthesized from 'format' script")
+        );
+    }
+
+    #[test]
+    fn does_not_synthesize_from_an_opaque_format_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"format": "my-formatter ."}}"#,
+        )
+        .unwrap();
+
+        let commands = detector(Npm).resolve_commands(dir.path());
+
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.key == CanonicalCommand::Format.with(Modifier::Check)),
+            "an unrecognized formatter body should not synthesize a check variant"
+        );
+    }
+
+    #[test]
+    fn a_declared_check_script_beats_a_synthesized_one() {
+        use crate::detect;
+
+        // "format" is the check (a common real-world shape) and "format:fix"
+        // is the writer. Plain `format` resolves the fixer script (prefix@5);
+        // `format --check` resolves the rehomed check (@3), beating the check
+        // synthesized from "format:fix" (@2).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"format": "prettier --check .", "format:fix": "prettier -w ."}}"#,
+        )
+        .unwrap();
+
+        let groups = vec![detect::DetectorGroup::new(vec![
+            Box::new(AssumeInstalled(detector(Npm))) as Box<dyn Detector>,
+        ])];
+
+        let plain = detect::resolve_all(
+            &groups,
+            dir.path(),
+            &[CanonicalCommand::Format.into()],
+            false,
+        );
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].cmd, "npm run format:fix");
+        assert_eq!(plain[0].priority, 5);
+
+        let check = detect::resolve_all(
+            &groups,
+            dir.path(),
+            &[CanonicalCommand::Format.with(Modifier::Check)],
+            false,
+        );
+        assert_eq!(check.len(), 1);
+        assert_eq!(check[0].cmd, "npm run format");
+        assert_eq!(check[0].priority, 3);
     }
 }

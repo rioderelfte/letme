@@ -379,7 +379,7 @@ mod tests {
         ]));
         assert!(!should_print(&[exec(), disabled(), disabled()]));
         assert!(should_print(&[
-            row("doctor", Some("health checks"), success(10)),
+            row("build", Some("cargo build"), success(10)),
             exec()
         ]));
     }

@@ -36,11 +36,16 @@ impl Detector for CargoDetector {
                 CanonicalCommand::Lint,
             ),
             self.make_command(
-                CanonicalCommand::Fix,
+                CanonicalCommand::Lint.with(Modifier::Fix),
                 "cargo clippy --fix --allow-dirty --allow-staged".into(),
                 10,
             ),
             self.make_command(CanonicalCommand::Format, "cargo fmt".into(), 10),
+            self.make_command(
+                CanonicalCommand::Format.with(Modifier::Check),
+                "cargo fmt --check".into(),
+                10,
+            ),
             self.make_command(CanonicalCommand::Build, "cargo build".into(), 10),
             self.make_command(CanonicalCommand::Clean, "cargo clean".into(), 10),
         ]
@@ -71,15 +76,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let commands = CargoDetector.resolve_commands(dir.path());
 
-        let canonicals: Vec<_> = commands.iter().map(|c| c.canonical).collect();
+        let canonicals: Vec<_> = commands.iter().map(|c| c.key.canonical).collect();
         assert!(canonicals.contains(&CanonicalCommand::Test));
         assert!(canonicals.contains(&CanonicalCommand::Lint));
         assert!(canonicals.contains(&CanonicalCommand::Typecheck));
-        assert!(canonicals.contains(&CanonicalCommand::Fix));
         assert!(canonicals.contains(&CanonicalCommand::Format));
         assert!(canonicals.contains(&CanonicalCommand::Build));
         assert!(canonicals.contains(&CanonicalCommand::Clean));
-        assert_eq!(commands.len(), 7);
+        assert_eq!(commands.len(), 8);
+
+        let format_check = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
+            .unwrap();
+        assert_eq!(format_check.cmd, "cargo fmt --check");
+
+        let lint_fix = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Lint.with(Modifier::Fix))
+            .unwrap();
+        assert_eq!(
+            lint_fix.cmd,
+            "cargo clippy --fix --allow-dirty --allow-staged"
+        );
     }
 
     #[test]
@@ -89,14 +108,14 @@ mod tests {
 
         let typecheck = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Typecheck)
+            .find(|c| c.key.canonical == CanonicalCommand::Typecheck)
             .unwrap();
         assert_eq!(typecheck.cmd, "cargo check");
         assert_eq!(typecheck.covered_by, Some(CanonicalCommand::Lint));
         assert!(
             commands
                 .iter()
-                .all(|c| c.canonical == CanonicalCommand::Typecheck || c.covered_by.is_none())
+                .all(|c| c.key.canonical == CanonicalCommand::Typecheck || c.covered_by.is_none())
         );
     }
 }

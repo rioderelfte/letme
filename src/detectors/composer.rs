@@ -39,9 +39,9 @@ impl Detector for ComposerDetector {
                 } else {
                     resolve_composite_canonical(name, elements, &scripts)
                 };
-                if let Some((canonical, priority)) = result {
+                if let Some((key, priority)) = result {
                     let cmd = format!("composer run {name}");
-                    let mut rc = self.make_command(canonical, cmd, priority);
+                    let mut rc = self.make_command(key, cmd, priority);
                     if elements.len() == 1 {
                         rc.label = elements[0].clone();
                     } else {
@@ -49,11 +49,39 @@ impl Detector for ComposerDetector {
                     }
                     commands.push(rc);
                 }
+
+                // Composites and @-references are too opaque to synthesize
+                // from, and bare tool names only resolve inside composer.
+                if let [body] = elements.as_slice()
+                    && !body.starts_with('@')
+                {
+                    for &target in CommandKey::VARIANTS {
+                        if let Some(variant) = synthesize_variant(target, body)
+                            && all_parts_pathed(&variant)
+                        {
+                            let cmd = variant.render(|part| part.to_string());
+                            let mut rc = self.make_command(variant.key, cmd.clone(), 2);
+                            rc.label = cmd;
+                            rc.note = Some(format!("synthesized from '{name}' script"));
+                            commands.push(rc);
+                        }
+                    }
+                }
             }
         }
 
         commands
     }
+}
+
+/// Every part's tool token (after skipping an interpreter prefix) must be
+/// path-qualified, e.g. `vendor/bin/php-cs-fixer`. A synthesized command runs
+/// outside `composer run-script`, so bare tool names wouldn't resolve.
+fn all_parts_pathed(variant: &SynthesizedVariant) -> bool {
+    variant.parts().iter().all(|part| {
+        let tokens: Vec<&str> = part.split_whitespace().collect();
+        tool_index(&tokens).is_some_and(|i| tokens[i].contains('/'))
+    })
 }
 
 fn read_composer_scripts(dir: &Path) -> Option<BTreeMap<String, Vec<String>>> {
@@ -80,16 +108,17 @@ fn read_composer_scripts(dir: &Path) -> Option<BTreeMap<String, Vec<String>>> {
 }
 
 /// For composite (multi-element) scripts, resolve `@`-references and check
-/// whether all elements agree on a single canonical command.
+/// whether all elements agree on a single detection key.
 ///
-/// Returns `Some((canonical, priority))` if consistent, `None` if mixed or
+/// Returns `Some((key, priority))` if consistent, `None` if mixed or
 /// unresolvable (the composite is skipped).
 fn resolve_composite_canonical(
     name: &str,
     elements: &[String],
     scripts: &BTreeMap<String, Vec<String>>,
-) -> Option<(CanonicalCommand, u32)> {
-    let mut canonicals = Vec::new();
+) -> Option<(CommandKey, u32)> {
+    let mut keys = Vec::new();
+    let mut saw_format_verify = false;
     for element in elements {
         let cmd = if let Some(ref_name) = element.strip_prefix('@') {
             // Resolve @-reference: look up in the scripts map
@@ -107,24 +136,26 @@ fn resolve_composite_canonical(
         } else {
             element.as_str()
         };
-        if let Some(canonical) = infer_from_command(cmd).canonical() {
-            canonicals.push(canonical);
+        let inference = infer_from_command(cmd);
+        if let Some(key) = inference.key() {
+            keys.push(key);
+        } else if inference == Inference::FormatVerify {
+            saw_format_verify = true;
         }
     }
 
-    if canonicals.is_empty() {
-        return None;
+    if keys.is_empty() {
+        return if saw_format_verify {
+            combine(map_script_name(name), Inference::FormatVerify)
+        } else {
+            None
+        };
     }
 
-    // All must agree on the same canonical
-    let first = canonicals[0];
-    if canonicals.iter().all(|c| *c == first) {
-        let priority = match map_script_name(name) {
-            Some((name_cmd, _)) if name_cmd == first => 10,
-            Some(_) => 3, // name disagrees with content
-            None => 7,
-        };
-        Some((first, priority))
+    // All must agree on the same key
+    let first = keys[0];
+    if keys.iter().all(|k| *k == first) {
+        combine(map_script_name(name), Inference::Canonical(first))
     } else {
         None // mixed concerns, skip
     }
@@ -206,7 +237,7 @@ mod tests {
 
         let format_cmds: Vec<_> = commands
             .iter()
-            .filter(|c| c.canonical == CanonicalCommand::Format)
+            .filter(|c| c.key.canonical == CanonicalCommand::Format)
             .collect();
         let format_exact = format_cmds
             .iter()
@@ -217,7 +248,7 @@ mod tests {
         // The lint name carries it; the content is only a format-verify.
         let lint_cmds: Vec<_> = commands
             .iter()
-            .filter(|c| c.canonical == CanonicalCommand::Lint)
+            .filter(|c| c.key.canonical == CanonicalCommand::Lint)
             .collect();
         let lint_reclassified = lint_cmds
             .iter()
@@ -227,7 +258,7 @@ mod tests {
 
         let lint_cmds: Vec<_> = commands
             .iter()
-            .filter(|c| c.canonical == CanonicalCommand::Lint)
+            .filter(|c| c.key.canonical == CanonicalCommand::Lint)
             .collect();
         let analyse = lint_cmds
             .iter()
@@ -239,14 +270,14 @@ mod tests {
             .iter()
             .find(|c| c.cmd == "composer run check")
             .unwrap();
-        assert_eq!(check.canonical, CanonicalCommand::Lint);
+        assert_eq!(check.key.canonical, CanonicalCommand::Lint);
         assert_eq!(check.priority, 10);
 
         let test = commands
             .iter()
             .find(|c| c.cmd == "composer run test")
             .unwrap();
-        assert_eq!(test.canonical, CanonicalCommand::Test);
+        assert_eq!(test.key.canonical, CanonicalCommand::Test);
         assert_eq!(test.priority, 10);
     }
 
@@ -272,8 +303,37 @@ mod tests {
             .iter()
             .find(|c| c.cmd == "composer run lint")
             .unwrap();
-        assert_eq!(check.canonical, CanonicalCommand::Lint);
+        assert_eq!(check.key.canonical, CanonicalCommand::Lint);
         assert_eq!(check.priority, 10);
+    }
+
+    #[test]
+    fn all_format_verify_composite_resolves_name_dependently() {
+        // Every recognized element is a format-verify, so the composite
+        // resolves through combine() by its name, like the single-element
+        // "lint": "prettier --check ." would.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{
+                "scripts": {
+                    "cs-check": "php-cs-fixer fix --dry-run --diff",
+                    "pint-check": "pint --test",
+                    "lint": ["@cs-check", "@pint-check"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let detector = ComposerDetector;
+        let commands = detector.resolve_commands(dir.path());
+
+        let lint = commands
+            .iter()
+            .find(|c| c.cmd == "composer run lint")
+            .unwrap();
+        assert_eq!(lint.key, CommandKey::from(CanonicalCommand::Lint));
+        assert_eq!(lint.priority, 10);
     }
 
     #[test]
@@ -321,22 +381,25 @@ mod tests {
         let detector = ComposerDetector;
         let commands = detector.resolve_commands(dir.path());
 
-        // A standalone format-verify is unclassified and does not surface.
-        assert!(
-            commands.iter().all(|c| c.cmd != "composer run cs-check"),
-            "format-verify 'cs-check' should not resolve to any canonical command"
-        );
+        // A standalone format-verify with no matching name rehomes to the
+        // check variant at the unmatched-content priority.
+        let cs_check = commands
+            .iter()
+            .find(|c| c.cmd == "composer run cs-check")
+            .unwrap();
+        assert_eq!(cs_check.key, CanonicalCommand::Format.with(Modifier::Check));
+        assert_eq!(cs_check.priority, 7);
 
-        // The format-verify element is invisible, so the composite is no longer
-        // "mixed": it collapses to the remaining Test concern, at the low priority
-        // used when the name (check maps to Lint) disagrees with the content
-        // (Test). In a real project this is harmless: it's shadowed by the
-        // standalone `test`.
+        // The composite scan doesn't see the format-verify element, so it isn't
+        // "mixed": it collapses to the remaining Test concern, at the low
+        // priority used when the name (check maps to Lint) disagrees with the
+        // content (Test). In a real project this is harmless: it's shadowed by
+        // the standalone `test`.
         let check = commands
             .iter()
             .find(|c| c.cmd == "composer run check")
             .unwrap();
-        assert_eq!(check.canonical, CanonicalCommand::Test);
+        assert_eq!(check.key.canonical, CanonicalCommand::Test);
         assert_eq!(check.priority, 3);
     }
 
@@ -351,12 +414,92 @@ mod tests {
         assert!(
             commands
                 .iter()
-                .any(|c| c.canonical == CanonicalCommand::Install)
+                .any(|c| c.key.canonical == CanonicalCommand::Install)
         );
         assert!(
             commands
                 .iter()
-                .any(|c| c.canonical == CanonicalCommand::Clean)
+                .any(|c| c.key.canonical == CanonicalCommand::Clean)
+        );
+    }
+
+    #[test]
+    fn synthesizes_format_check_from_a_pathed_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"scripts": {"format": "vendor/bin/php-cs-fixer fix"}}"#,
+        )
+        .unwrap();
+
+        let commands = ComposerDetector.resolve_commands(dir.path());
+
+        let synthesized = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
+            .unwrap();
+        assert_eq!(
+            synthesized.cmd,
+            "vendor/bin/php-cs-fixer fix --dry-run --diff"
+        );
+        assert_eq!(synthesized.priority, 2);
+        assert_eq!(
+            synthesized.note.as_deref(),
+            Some("synthesized from 'format' script")
+        );
+    }
+
+    #[test]
+    fn does_not_synthesize_from_a_bare_tool_name() {
+        // Composer's own PATH injection is what lets a bare tool name resolve
+        // inside `composer run-script`; a synthesized command runs outside
+        // that, so it declines rather than guess.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"scripts": {"format": "php-cs-fixer fix"}}"#,
+        )
+        .unwrap();
+
+        let commands = ComposerDetector.resolve_commands(dir.path());
+
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.key == CanonicalCommand::Format.with(Modifier::Check)),
+            "a bare (non-pathed) tool name should not synthesize a check variant"
+        );
+    }
+
+    #[test]
+    fn does_not_synthesize_from_a_composite_or_a_bare_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{
+                "scripts": {
+                    "format": ["vendor/bin/php-cs-fixer fix", "vendor/bin/pint"],
+                    "ref-only": ["@format"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let commands = ComposerDetector.resolve_commands(dir.path());
+
+        let no_synthesized = |name: &str| {
+            !commands.iter().any(|c| {
+                c.key == CanonicalCommand::Format.with(Modifier::Check)
+                    && c.note.as_deref() == Some(&format!("synthesized from '{name}' script"))
+            })
+        };
+        assert!(
+            no_synthesized("format"),
+            "a multi-element composite script should not synthesize a check variant"
+        );
+        assert!(
+            no_synthesized("ref-only"),
+            "a single bare @-reference should not synthesize a check variant"
         );
     }
 }

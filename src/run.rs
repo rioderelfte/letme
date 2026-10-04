@@ -5,10 +5,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::cli::Cli;
-use crate::config::Config;
-use crate::detect::{self, CanonicalCommand, DetectorGroup, ResolvedCommand};
-use crate::doctor;
+use crate::detect::{self, CanonicalCommand, CommandKey, DetectorGroup, ResolvedCommand};
+use crate::grammar::Globals;
 use crate::local_config::{FILE_NAME, LocalConfig};
 use crate::summary::{self, Outcome, SummaryRow};
 use crate::theme::{Theme, sanitize};
@@ -28,8 +26,9 @@ impl std::error::Error for CommandExit {}
 /// One unit of work in a run, in request order.
 #[derive(Debug)]
 enum PlanEntry<'a> {
-    Doctor,
-    NotDetected(CanonicalCommand),
+    NotDetected(CommandKey),
+    // Disabling is canonical-level, so this names the canonical, not the
+    // requested key.
     Disabled(CanonicalCommand),
     Covered {
         canonical: CanonicalCommand,
@@ -41,28 +40,19 @@ enum PlanEntry<'a> {
 pub fn run(
     dir: &Path,
     groups: &[DetectorGroup],
-    cli: &Cli,
+    keys: &[CommandKey],
+    globals: Globals,
     theme: &Theme,
-    config: &Config,
     local: &LocalConfig,
 ) -> Result<()> {
-    let expanded = config
-        .expand_aliases(&cli.commands)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let enabled = local.enabled(keys, globals.verbose);
 
-    let canonicals: Vec<CanonicalCommand> = expanded
-        .iter()
-        .filter(|n| *n != "doctor")
-        .filter_map(|n| n.parse().ok())
-        .collect();
-    let canonicals = local.enabled(&canonicals, cli.verbose);
+    // Resolve all keys in one pass (avoids redundant detect() calls)
+    let resolved = detect::resolve_all(groups, dir, &enabled, globals.verbose);
 
-    // Resolve all canonical commands in one pass (avoids redundant detect() calls)
-    let resolved = detect::resolve_all(groups, dir, &canonicals, cli.verbose);
-
-    let chained = expanded.len() > 1;
-    let plan = build_plan(&expanded, &resolved, chained, &local.disabled)?;
-    let (rows, failure) = execute_plan(&plan, dir, groups, cli.interactive, theme)?;
+    let chained = keys.len() > 1;
+    let plan = build_plan(keys, &resolved, chained, &local.disabled)?;
+    let (rows, failure) = execute_plan(&plan, dir, globals.interactive, theme)?;
 
     if summary::should_print(&rows) {
         println!();
@@ -76,51 +66,46 @@ pub fn run(
 }
 
 fn build_plan<'a>(
-    expanded: &[String],
+    keys: &[CommandKey],
     resolved: &'a [ResolvedCommand],
     chained: bool,
     disabled: &HashSet<CanonicalCommand>,
 ) -> Result<Vec<PlanEntry<'a>>> {
     let mut plan = Vec::new();
-    for name in expanded {
-        if name == "doctor" {
-            plan.push(PlanEntry::Doctor);
-            continue;
-        }
-
-        let canonical: CanonicalCommand = name.parse().unwrap();
-
+    for &key in keys {
         // Checked before resolution: disabled commands never reach resolve_all,
         // so an empty match must not fall through to "not detected"
-        if disabled.contains(&canonical) {
+        if disabled.contains(&key.canonical) {
             if chained {
-                plan.push(PlanEntry::Disabled(canonical));
+                plan.push(PlanEntry::Disabled(key.canonical));
                 continue;
             }
-            bail!("{canonical} is disabled by {FILE_NAME}.");
+            bail!("{} is disabled by {FILE_NAME}", key.canonical);
         }
 
-        let cmds: Vec<&ResolvedCommand> = resolved
-            .iter()
-            .filter(|r| r.canonical == canonical)
-            .collect();
+        let cmds: Vec<&ResolvedCommand> = resolved.iter().filter(|r| r.key == key).collect();
 
         if cmds.is_empty() {
             if chained {
-                plan.push(PlanEntry::NotDetected(canonical));
+                plan.push(PlanEntry::NotDetected(key));
                 continue;
             }
-            bail!("No {canonical} command detected.");
+            bail!("no {key} command detected");
         }
 
         plan.extend(cmds.into_iter().map(|cmd| match coverer(resolved, cmd) {
-            Some(by) => PlanEntry::Covered { canonical, by },
+            Some(by) => PlanEntry::Covered {
+                canonical: key.canonical,
+                by,
+            },
             None => PlanEntry::Exec(cmd),
         }));
     }
     Ok(plan)
 }
 
+/// A command is covered only by the plain key of the canonical it names:
+/// `letme lint --fix typecheck` on cargo still runs `cargo check`.
 fn coverer<'a>(
     resolved: &'a [ResolvedCommand],
     cmd: &ResolvedCommand,
@@ -128,13 +113,12 @@ fn coverer<'a>(
     let covered_by = cmd.covered_by?;
     resolved
         .iter()
-        .find(|r| r.canonical == covered_by && r.detector_name == cmd.detector_name)
+        .find(|r| r.key == CommandKey::from(covered_by) && r.detector_name == cmd.detector_name)
 }
 
 fn execute_plan(
     plan: &[PlanEntry],
     dir: &Path,
-    groups: &[DetectorGroup],
     interactive: bool,
     theme: &Theme,
 ) -> Result<(Vec<SummaryRow>, Option<i32>)> {
@@ -143,39 +127,16 @@ fn execute_plan(
 
     for entry in plan {
         match entry {
-            PlanEntry::Doctor => {
-                let outcome = if failure.is_some() {
-                    Outcome::NotRun
-                } else {
-                    let start = Instant::now();
-                    let all_passed = doctor::run(dir, groups, theme)?;
-                    let duration = start.elapsed();
-                    if all_passed {
-                        Outcome::Success { duration }
-                    } else {
-                        failure = Some(1);
-                        Outcome::Failure {
-                            duration,
-                            code: Some(1),
-                        }
-                    }
-                };
-                rows.push(SummaryRow {
-                    name: "doctor".to_string(),
-                    cmd: Some("health checks".to_string()),
-                    outcome,
-                });
-            }
-            PlanEntry::NotDetected(canonical) => {
+            PlanEntry::NotDetected(key) => {
                 if failure.is_none() {
                     eprintln!(
                         "  {} {}",
                         "⊘".style(theme.muted),
-                        format!("no {canonical} command detected, skipping").style(theme.muted),
+                        format!("no {key} command detected, skipping").style(theme.muted),
                     );
                 }
                 rows.push(SummaryRow {
-                    name: canonical.to_string(),
+                    name: key.to_string(),
                     cmd: None,
                     outcome: Outcome::NotDetected,
                 });
@@ -220,7 +181,7 @@ fn execute_plan(
                     outcome
                 };
                 rows.push(SummaryRow {
-                    name: cmd.canonical.to_string(),
+                    name: cmd.key.to_string(),
                     cmd: Some(cmd.cmd.clone()),
                     outcome,
                 });
@@ -284,11 +245,11 @@ fn execute_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::{Ecosystem, Tier};
+    use crate::detect::{CommandKey, Ecosystem, Tier};
 
     fn rc(canonical: CanonicalCommand, cmd: &str) -> ResolvedCommand {
         ResolvedCommand {
-            canonical,
+            key: CommandKey::from(canonical),
             cmd: cmd.to_string(),
             label: cmd.to_string(),
             tier: Tier::Tier4,
@@ -296,6 +257,7 @@ mod tests {
             detector_name: "test".to_string(),
             priority: 10,
             covered_by: None,
+            note: None,
         }
     }
 
@@ -312,8 +274,11 @@ mod tests {
         }
     }
 
-    fn names(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| n.to_string()).collect()
+    fn keys(names: &[&str]) -> Vec<CommandKey> {
+        names
+            .iter()
+            .map(|n| CommandKey::from(CanonicalCommand::from_name(n).unwrap()))
+            .collect()
     }
 
     #[test]
@@ -323,8 +288,7 @@ mod tests {
             rc(CanonicalCommand::Test, "pnpm test"),
             rc(CanonicalCommand::Build, "cargo build"),
         ];
-        let plan =
-            build_plan(&names(&["test", "build"]), &resolved, true, &HashSet::new()).unwrap();
+        let plan = build_plan(&keys(&["test", "build"]), &resolved, true, &HashSet::new()).unwrap();
         let cmds: Vec<&str> = plan
             .iter()
             .map(|entry| match entry {
@@ -338,25 +302,28 @@ mod tests {
     #[test]
     fn build_plan_marks_undetected_in_chains() {
         let resolved = vec![rc(CanonicalCommand::Test, "cargo test")];
-        let plan = build_plan(&names(&["e2e", "test"]), &resolved, true, &HashSet::new()).unwrap();
+        let plan = build_plan(&keys(&["e2e", "test"]), &resolved, true, &HashSet::new()).unwrap();
         assert!(matches!(
             plan[0],
-            PlanEntry::NotDetected(CanonicalCommand::E2e)
+            PlanEntry::NotDetected(CommandKey {
+                canonical: CanonicalCommand::E2e,
+                modifier: None
+            })
         ));
         assert!(matches!(plan[1], PlanEntry::Exec(_)));
     }
 
     #[test]
     fn build_plan_errors_for_single_undetected_name() {
-        let err = build_plan(&names(&["e2e"]), &[], false, &HashSet::new()).unwrap_err();
-        assert_eq!(err.to_string(), "No e2e command detected.");
+        let err = build_plan(&keys(&["e2e"]), &[], false, &HashSet::new()).unwrap_err();
+        assert_eq!(err.to_string(), "no e2e command detected");
     }
 
     #[test]
     fn build_plan_marks_disabled_in_chains() {
         let resolved = vec![rc(CanonicalCommand::Test, "cargo test")];
         let disabled = HashSet::from([CanonicalCommand::Format]);
-        let plan = build_plan(&names(&["format", "test"]), &resolved, true, &disabled).unwrap();
+        let plan = build_plan(&keys(&["format", "test"]), &resolved, true, &disabled).unwrap();
         assert!(matches!(
             plan[0],
             PlanEntry::Disabled(CanonicalCommand::Format)
@@ -367,16 +334,16 @@ mod tests {
     #[test]
     fn build_plan_errors_for_single_disabled_name() {
         let disabled = HashSet::from([CanonicalCommand::Format]);
-        let err = build_plan(&names(&["format"]), &[], false, &disabled).unwrap_err();
-        assert_eq!(err.to_string(), "format is disabled by .letme.local.toml.");
+        let err = build_plan(&keys(&["format"]), &[], false, &disabled).unwrap_err();
+        assert_eq!(err.to_string(), "format is disabled by .letme.local.toml");
     }
 
     #[test]
     fn build_plan_disabled_beats_not_detected() {
         // Disabled commands are filtered out before resolution, so they are
-        // always absent from `resolved` — the disabled check must win
+        // always absent from `resolved`. The disabled check must win.
         let disabled = HashSet::from([CanonicalCommand::Format]);
-        let err = build_plan(&names(&["format"]), &[], false, &disabled).unwrap_err();
+        let err = build_plan(&keys(&["format"]), &[], false, &disabled).unwrap_err();
         assert!(err.to_string().contains("disabled"), "got: {err}");
     }
 
@@ -392,7 +359,7 @@ mod tests {
             ),
         ];
         let plan = build_plan(
-            &names(&["lint", "typecheck"]),
+            &keys(&["lint", "typecheck"]),
             &resolved,
             true,
             &HashSet::new(),
@@ -417,7 +384,7 @@ mod tests {
             CanonicalCommand::Lint,
             "test",
         )];
-        let plan = build_plan(&names(&["typecheck"]), &resolved, false, &HashSet::new()).unwrap();
+        let plan = build_plan(&keys(&["typecheck"]), &resolved, false, &HashSet::new()).unwrap();
 
         assert!(matches!(plan[0], PlanEntry::Exec(c) if c.cmd == "cargo check"));
     }
@@ -436,7 +403,7 @@ mod tests {
             ),
         ];
         let plan = build_plan(
-            &names(&["lint", "typecheck"]),
+            &keys(&["lint", "typecheck"]),
             &resolved,
             true,
             &HashSet::new(),
@@ -457,7 +424,7 @@ mod tests {
             },
         ];
         let dir = tempfile::tempdir().unwrap();
-        let (rows, failure) = execute_plan(&plan, dir.path(), &[], false, &Theme::plain()).unwrap();
+        let (rows, failure) = execute_plan(&plan, dir.path(), false, &Theme::plain()).unwrap();
 
         assert_eq!(failure, None);
         assert!(matches!(rows[0].outcome, Outcome::Success { .. }));
@@ -479,7 +446,7 @@ mod tests {
             PlanEntry::Exec(&resolved),
         ];
         let dir = tempfile::tempdir().unwrap();
-        let (rows, failure) = execute_plan(&plan, dir.path(), &[], false, &Theme::plain()).unwrap();
+        let (rows, failure) = execute_plan(&plan, dir.path(), false, &Theme::plain()).unwrap();
 
         assert_eq!(failure, None);
         assert_eq!(rows[0].name, "format");
@@ -497,7 +464,7 @@ mod tests {
         ];
         let plan: Vec<PlanEntry> = resolved.iter().map(PlanEntry::Exec).collect();
         let dir = tempfile::tempdir().unwrap();
-        let (rows, failure) = execute_plan(&plan, dir.path(), &[], false, &Theme::plain()).unwrap();
+        let (rows, failure) = execute_plan(&plan, dir.path(), false, &Theme::plain()).unwrap();
 
         assert_eq!(failure, Some(7));
         assert!(matches!(rows[0].outcome, Outcome::Success { .. }));

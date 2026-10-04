@@ -88,7 +88,11 @@ impl Detector for EslintDetector {
         let exec = js::detect_manager(dir).exec_prefix();
         vec![
             self.make_command(CanonicalCommand::Lint, format!("{exec} eslint ."), 5),
-            self.make_command(CanonicalCommand::Fix, format!("{exec} eslint --fix ."), 5),
+            self.make_command(
+                CanonicalCommand::Lint.with(Modifier::Fix),
+                format!("{exec} eslint --fix ."),
+                5,
+            ),
         ]
     }
 }
@@ -115,7 +119,11 @@ impl Detector for OxlintDetector {
         let exec = js::detect_manager(dir).exec_prefix();
         vec![
             self.make_command(CanonicalCommand::Lint, format!("{exec} oxlint"), 3),
-            self.make_command(CanonicalCommand::Fix, format!("{exec} oxlint --fix"), 3),
+            self.make_command(
+                CanonicalCommand::Lint.with(Modifier::Fix),
+                format!("{exec} oxlint --fix"),
+                3,
+            ),
         ]
     }
 }
@@ -139,11 +147,18 @@ impl Detector for PrettierDetector {
 
     fn resolve_commands(&self, dir: &Path) -> Vec<ResolvedCommand> {
         let exec = js::detect_manager(dir).exec_prefix();
-        vec![self.make_command(
-            CanonicalCommand::Format,
-            format!("{exec} prettier --write ."),
-            5,
-        )]
+        vec![
+            self.make_command(
+                CanonicalCommand::Format,
+                format!("{exec} prettier --write ."),
+                5,
+            ),
+            self.make_command(
+                CanonicalCommand::Format.with(Modifier::Check),
+                format!("{exec} prettier --check ."),
+                5,
+            ),
+        ]
     }
 }
 
@@ -171,14 +186,24 @@ impl Detector for BiomeDetector {
         let exec = js::detect_manager(dir).exec_prefix();
         vec![
             self.make_command(CanonicalCommand::Lint, format!("{exec} biome check"), 10),
+            // Not the mechanical `biome check --fix`: plain linting goes
+            // through `check` (which also reports formatting), but fixing
+            // narrows to `lint` so it doesn't rewrite formatting too.
             self.make_command(
-                CanonicalCommand::Fix,
+                CanonicalCommand::Lint.with(Modifier::Fix),
                 format!("{exec} biome lint --fix ."),
                 10,
             ),
             self.make_command(
                 CanonicalCommand::Format,
                 format!("{exec} biome format --write"),
+                10,
+            ),
+            // Bare `biome format` is Biome's own check mode; it has no
+            // dedicated `--check` flag.
+            self.make_command(
+                CanonicalCommand::Format.with(Modifier::Check),
+                format!("{exec} biome format"),
                 10,
             ),
         ]
@@ -394,6 +419,18 @@ mod tests {
     }
 
     #[test]
+    fn prettier_resolves_format_check_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = PrettierDetector.resolve_commands(dir.path());
+        let check = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
+            .unwrap();
+        assert_eq!(check.cmd, "npx prettier --check .");
+        assert_eq!(check.priority, 5);
+    }
+
+    #[test]
     fn biome_detects_with_binary_and_config() {
         let dir = tempfile::tempdir().unwrap();
         make_node_bin(dir.path(), "biome");
@@ -457,7 +494,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let commands = TscDetector.resolve_commands(dir.path());
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].canonical, CanonicalCommand::Typecheck);
+        assert_eq!(commands[0].key.canonical, CanonicalCommand::Typecheck);
         assert_eq!(commands[0].cmd, "npx tsc --noEmit");
     }
 
@@ -529,7 +566,8 @@ mod tests {
                 vec![Box::new(CypressDetector) as Box<dyn detect::Detector>],
             ),
         ];
-        let result = detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::E2e], false);
+        let result =
+            detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::E2e.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "npx playwright test");
@@ -542,7 +580,7 @@ mod tests {
         let commands = EslintDetector.resolve_commands(dir.path());
         let fix = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Fix);
+            .find(|c| c.key == CanonicalCommand::Lint.with(Modifier::Fix));
         assert!(fix.is_some());
         assert_eq!(fix.unwrap().cmd, "npx eslint --fix .");
     }
@@ -553,11 +591,11 @@ mod tests {
         let commands = OxlintDetector.resolve_commands(dir.path());
         let lint = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Lint);
+            .find(|c| c.key.canonical == CanonicalCommand::Lint);
         assert_eq!(lint.unwrap().cmd, "npx oxlint");
         let fix = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Fix);
+            .find(|c| c.key == CanonicalCommand::Lint.with(Modifier::Fix));
         assert_eq!(fix.unwrap().cmd, "npx oxlint --fix");
     }
 
@@ -574,7 +612,8 @@ mod tests {
             detect::DetectorGroup::new(vec![Box::new(EslintDetector) as Box<dyn detect::Detector>]),
             detect::DetectorGroup::new(vec![Box::new(OxlintDetector) as Box<dyn detect::Detector>]),
         ];
-        let result = detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Lint], false);
+        let result =
+            detect::resolve_all(&groups, dir.path(), &[CanonicalCommand::Lint.into()], false);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].cmd, "npx eslint .");
@@ -587,9 +626,69 @@ mod tests {
         let commands = BiomeDetector.resolve_commands(dir.path());
         let fix = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Fix);
+            .find(|c| c.key == CanonicalCommand::Lint.with(Modifier::Fix));
         assert!(fix.is_some());
         assert_eq!(fix.unwrap().cmd, "npx biome lint --fix .");
+    }
+
+    #[test]
+    fn tier_four_variants_agree_with_what_synthesis_would_derive() {
+        // Hand-written tier-4 variants must match what tier-3 synthesis derives
+        // for the same tool. Biome's fix command is the deliberate exception
+        // (see the detector).
+        let dir = tempfile::tempdir().unwrap();
+        let check = CanonicalCommand::Format.with(Modifier::Check);
+        let fix = CanonicalCommand::Lint.with(Modifier::Fix);
+
+        let cases = [
+            (
+                PrettierDetector.resolve_commands(dir.path()),
+                CanonicalCommand::Format,
+                check,
+            ),
+            (
+                EslintDetector.resolve_commands(dir.path()),
+                CanonicalCommand::Lint,
+                fix,
+            ),
+            (
+                OxlintDetector.resolve_commands(dir.path()),
+                CanonicalCommand::Lint,
+                fix,
+            ),
+            (
+                BiomeDetector.resolve_commands(dir.path()),
+                CanonicalCommand::Format,
+                check,
+            ),
+        ];
+
+        for (commands, canonical, target) in cases {
+            let plain = commands.iter().find(|c| c.key == canonical.into()).unwrap();
+            let variant = commands.iter().find(|c| c.key == target).unwrap();
+            let derived =
+                synthesize_variant(target, &plain.cmd).map(|v| v.render(|p| p.to_string()));
+            assert_eq!(
+                derived.as_deref(),
+                Some(variant.cmd.as_str()),
+                "deriving {target} from {:?}",
+                plain.cmd
+            );
+        }
+    }
+
+    #[test]
+    fn biome_resolves_format_check_as_the_bare_form() {
+        // Bare `biome format` (no --write) is Biome's own check mode; it has
+        // no `--check` flag.
+        let dir = tempfile::tempdir().unwrap();
+        let commands = BiomeDetector.resolve_commands(dir.path());
+        let check = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
+            .unwrap();
+        assert_eq!(check.cmd, "npx biome format");
+        assert_eq!(check.priority, 10);
     }
 
     #[test]
@@ -600,7 +699,7 @@ mod tests {
         let commands = EslintDetector.resolve_commands(dir.path());
         let fix = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Fix)
+            .find(|c| c.key == CanonicalCommand::Lint.with(Modifier::Fix))
             .unwrap();
         assert_eq!(fix.cmd, "pnpm exec eslint --fix .");
     }
@@ -613,7 +712,7 @@ mod tests {
         let commands = EslintDetector.resolve_commands(dir.path());
         let fix = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Fix)
+            .find(|c| c.key == CanonicalCommand::Lint.with(Modifier::Fix))
             .unwrap();
         assert_eq!(fix.cmd, "yarn eslint --fix .");
     }
@@ -626,7 +725,7 @@ mod tests {
         let commands = EslintDetector.resolve_commands(dir.path());
         let fix = commands
             .iter()
-            .find(|c| c.canonical == CanonicalCommand::Fix)
+            .find(|c| c.key == CanonicalCommand::Lint.with(Modifier::Fix))
             .unwrap();
         assert_eq!(fix.cmd, "npx eslint --fix .");
     }

@@ -30,19 +30,19 @@ impl Detector for NxDetector {
         let mut commands = Vec::new();
 
         for target in workspace_targets(dir) {
-            let Some(canonical) = map_canonical_name(&target) else {
+            let Some(key) = map_canonical_name(&target) else {
                 continue;
             };
             // install/clean keep their package-manager meaning at tier 3;
             // nx targets with those names do something else.
             if matches!(
-                canonical,
+                key.canonical,
                 CanonicalCommand::Install | CanonicalCommand::Clean
             ) {
                 continue;
             }
             commands.push(self.make_command(
-                canonical,
+                key,
                 format!("{exec} nx run-many -t {target} --outputStyle=stream"),
                 3,
             ));
@@ -215,7 +215,7 @@ mod tests {
         let commands = commands_in(dir.path());
 
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].canonical, CanonicalCommand::Test);
+        assert_eq!(commands[0].key.canonical, CanonicalCommand::Test);
     }
 
     #[test]
@@ -255,12 +255,12 @@ mod tests {
         assert!(
             commands
                 .iter()
-                .any(|c| c.canonical == CanonicalCommand::Test)
+                .any(|c| c.key.canonical == CanonicalCommand::Test)
         );
         assert!(
             commands
                 .iter()
-                .any(|c| c.canonical == CanonicalCommand::Build)
+                .any(|c| c.key.canonical == CanonicalCommand::Build)
         );
         assert_eq!(commands.len(), 2);
     }
@@ -296,7 +296,7 @@ mod tests {
         let commands = commands_in(dir.path());
 
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].canonical, CanonicalCommand::Test);
+        assert_eq!(commands[0].key.canonical, CanonicalCommand::Test);
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
         let commands = commands_in(dir.path());
 
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].canonical, CanonicalCommand::E2e);
+        assert_eq!(commands[0].key.canonical, CanonicalCommand::E2e);
         assert_eq!(
             commands[0].cmd,
             "npx nx run-many -t e2e --outputStyle=stream"

@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::detect::CanonicalCommand;
+use crate::detect::{CanonicalCommand, CommandKey};
 use crate::theme::sanitize;
 
 pub const FILE_NAME: &str = ".letme.local.toml";
@@ -29,14 +29,15 @@ impl LocalConfig {
         }
     }
 
-    pub fn enabled(&self, commands: &[CanonicalCommand], verbose: bool) -> Vec<CanonicalCommand> {
-        commands
-            .iter()
+    /// Disabling is canonical-level: `disable = ["lint"]` disables `lint --fix`
+    /// too, since a variant is filtered on its plain canonical.
+    pub fn enabled(&self, keys: &[CommandKey], verbose: bool) -> Vec<CommandKey> {
+        keys.iter()
             .copied()
-            .filter(|c| {
-                let disabled = self.disabled.contains(c);
+            .filter(|key| {
+                let disabled = self.disabled.contains(&key.canonical);
                 if disabled && verbose {
-                    eprintln!("[verbose] {c}: disabled by {FILE_NAME}");
+                    eprintln!("[verbose] {key}: disabled by {FILE_NAME}");
                 }
                 !disabled
             })
@@ -50,12 +51,20 @@ fn parse(contents: &str) -> Result<LocalConfig> {
 
     let mut disabled = HashSet::new();
     for name in &raw.disable {
-        match name.parse::<CanonicalCommand>() {
-            Ok(cmd) => {
-                disabled.insert(cmd);
-            }
-            Err(e) => return Err(anyhow!("{FILE_NAME}: {}", sanitize(&e))),
+        if name.contains(' ') {
+            return Err(anyhow!(
+                "{FILE_NAME}: {}: variants cannot be disabled on their own",
+                sanitize(name)
+            ));
         }
+        let Some(cmd) = CanonicalCommand::from_name(name) else {
+            return Err(anyhow!(
+                "{FILE_NAME}: unknown command: {}. Valid commands: {}",
+                sanitize(name),
+                CanonicalCommand::all_names()
+            ));
+        };
+        disabled.insert(cmd);
     }
     Ok(LocalConfig { disabled })
 }
@@ -101,20 +110,20 @@ mod tests {
     fn parse_unknown_command_errors_and_echoes_name() {
         let err = parse(r#"disable = ["prettier"]"#).unwrap_err().to_string();
         assert!(err.contains(".letme.local.toml"), "got: {err}");
-        assert!(err.contains("Unknown command: prettier"), "got: {err}");
+        assert!(err.contains("unknown command: prettier"), "got: {err}");
         assert!(err.contains("format"), "got: {err}");
     }
 
     #[test]
     fn parse_rejects_doctor() {
         let err = parse(r#"disable = ["doctor"]"#).unwrap_err().to_string();
-        assert!(err.contains("Unknown command: doctor"), "got: {err}");
+        assert!(err.contains("unknown command: doctor"), "got: {err}");
     }
 
     #[test]
     fn parse_rejects_prefixes() {
         let err = parse(r#"disable = ["form"]"#).unwrap_err().to_string();
-        assert!(err.contains("Unknown command: form"), "got: {err}");
+        assert!(err.contains("unknown command: form"), "got: {err}");
     }
 
     #[test]
@@ -155,15 +164,41 @@ mod tests {
         };
         let enabled = config.enabled(
             &[
-                CanonicalCommand::Format,
-                CanonicalCommand::Lint,
-                CanonicalCommand::Test,
+                CommandKey::from(CanonicalCommand::Format),
+                CommandKey::from(CanonicalCommand::Lint),
+                CommandKey::from(CanonicalCommand::Test),
             ],
             false,
         );
         assert_eq!(
             enabled,
-            vec![CanonicalCommand::Lint, CanonicalCommand::Test]
+            vec![
+                CommandKey::from(CanonicalCommand::Lint),
+                CommandKey::from(CanonicalCommand::Test)
+            ]
+        );
+    }
+
+    #[test]
+    fn enabled_filters_a_variant_via_its_plain_canonical() {
+        let config = LocalConfig {
+            disabled: HashSet::from([CanonicalCommand::Format]),
+        };
+        let enabled = config.enabled(
+            &[CanonicalCommand::Format.with(crate::detect::Modifier::Check)],
+            false,
+        );
+        assert!(enabled.is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_variant_disable_entries() {
+        let err = parse(r#"disable = ["lint --fix"]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("variants cannot be disabled on their own"),
+            "got: {err}"
         );
     }
 }

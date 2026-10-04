@@ -103,11 +103,18 @@ impl Detector for PhpCsFixerDetector {
     }
 
     fn resolve_commands(&self, _dir: &Path) -> Vec<ResolvedCommand> {
-        vec![self.make_command(
-            CanonicalCommand::Format,
-            "vendor/bin/php-cs-fixer fix".into(),
-            10,
-        )]
+        vec![
+            self.make_command(
+                CanonicalCommand::Format,
+                "vendor/bin/php-cs-fixer fix".into(),
+                10,
+            ),
+            self.make_command(
+                CanonicalCommand::Format.with(Modifier::Check),
+                "vendor/bin/php-cs-fixer fix --dry-run --diff".into(),
+                10,
+            ),
+        ]
     }
 }
 
@@ -202,6 +209,32 @@ mod tests {
         make_vendor_bin(dir.path(), "php-cs-fixer");
 
         assert!(!PhpCsFixerDetector.detect(dir.path()));
+    }
+
+    #[test]
+    fn php_cs_fixer_resolves_format_and_format_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = PhpCsFixerDetector.resolve_commands(dir.path());
+
+        let format = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.into())
+            .unwrap();
+        assert_eq!(format.cmd, "vendor/bin/php-cs-fixer fix");
+
+        let check = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
+            .unwrap();
+        assert_eq!(check.cmd, "vendor/bin/php-cs-fixer fix --dry-run --diff");
+        assert_eq!(check.priority, 10);
+
+        // The check form above is written by hand, and tier-3 synthesis
+        // rewrites the same tool from its own table. They must agree, or
+        // `letme format --check` would differ by tier.
+        let target = CanonicalCommand::Format.with(Modifier::Check);
+        let derived = synthesize_variant(target, &format.cmd).map(|v| v.render(|p| p.to_string()));
+        assert_eq!(derived.as_deref(), Some(check.cmd.as_str()));
     }
 
     #[test]
