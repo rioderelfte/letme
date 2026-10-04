@@ -46,7 +46,7 @@ impl Detector for CargoDetector {
                 "cargo fmt --check".into(),
                 10,
             ),
-            self.make_command(CanonicalCommand::Build, "cargo build".into(), 10),
+            self.make_command(CanonicalCommand::Build, "cargo build --release".into(), 10),
             self.make_command(CanonicalCommand::Clean, "cargo clean".into(), 10),
         ]
     }
@@ -90,6 +90,12 @@ mod tests {
             .find(|c| c.key == CanonicalCommand::Format.with(Modifier::Check))
             .unwrap();
         assert_eq!(format_check.cmd, "cargo fmt --check");
+
+        let build = commands
+            .iter()
+            .find(|c| c.key == CanonicalCommand::Build.into())
+            .unwrap();
+        assert_eq!(build.cmd, "cargo build --release");
 
         let lint_fix = commands
             .iter()
